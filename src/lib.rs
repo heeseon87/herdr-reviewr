@@ -135,6 +135,9 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
     let mut app = App::new(repo, scope, cfg.base.clone());
     app.set_plugin_config(plugin_config);
     app.set_cli_theme(cfg.theme.clone());
+    if let Some(side_by_side) = cfg.side_by_side {
+        app.side_by_side = side_by_side;
+    }
     if let Some(wrap) = cfg.wrap {
         app.wrap = wrap;
     }
@@ -769,6 +772,10 @@ fn event_loop(
             if app.mode == crate::app::Mode::Search && !event::poll(Duration::ZERO)? {
                 app.build_search_preview();
             }
+            // The read pane's width decides whether side-by-side fits, so it is noted before any
+            // geometry is measured. Leaving it to the paint would make the frame's heights and
+            // hit-testing disagree with what the previous frame painted (specs/diff-view.md).
+            app.note_diff_width(ui::diff_inner_width(area, app));
             let viewport = ui::diff_viewport_height(area, app);
             let effective = if app.composing() {
                 let box_h = ui::composer_height(app, ui::diff_inner_width(area, app));
@@ -1543,6 +1550,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::NextFile => app.next_file(),
             K::PrevFile => app.prev_file(),
             K::Wrap => app.toggle_wrap(),
+            K::SideBySide => app.toggle_side_by_side(),
             K::Preview => app.toggle_preview(),
             K::NavigatorPosition => app.cycle_navigator_position(),
             K::NavigatorGrow => app.resize_navigator(4),

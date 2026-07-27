@@ -20,7 +20,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
 use crate::config::NavigatorPosition;
-use crate::diff::{FileDiff, FileState, Row};
+use crate::diff::{Column, FileDiff, FileState, Row};
 use crate::file_list::{Annotation, RowKind};
 use crate::forge;
 use crate::keymap::Keymap;
@@ -203,8 +203,9 @@ pub fn in_diff_pane(area: Rect, app: &App, col: u16, row: u16) -> bool {
 }
 
 /// The logical diff-row index a click at `(col, row)` lands on, or `None` if outside the
-/// diff pane. `heights` (display rows per logical row) and `diff_scroll` reproduce the
-/// painted window, so a click on any display line of a wrapped row maps to that row.
+/// diff pane. `heights` (display rows per unit) and `diff_scroll` reproduce the painted
+/// window, so a click on any display line of a wrapped row maps to that row. In the
+/// side-by-side layout the column decides which half of the unit the click claims.
 #[must_use]
 pub fn hit_diff(
     area: Rect,
@@ -220,13 +221,29 @@ pub fn hit_diff(
     }
     let target = (row - inner.y) as usize;
     let mut acc = 0;
-    for (li, h) in heights.iter().enumerate().skip(diff_scroll) {
+    let units = app.diff_units();
+    for (ui, h) in heights.iter().enumerate().skip(diff_scroll) {
         acc += h;
         if target < acc {
-            return Some(li);
+            let unit = *units.get(ui)?;
+            let column = if app.side_by_side_active()
+                && (col - inner.x) as usize > columns(inner.width as usize).0
+            {
+                Column::Right
+            } else {
+                Column::Left
+            };
+            return unit.pick(column);
         }
     }
     None
+}
+
+/// The two column widths of a side-by-side pane at `width`, the divider taking one cell
+/// between them (specs/diff-view.md).
+fn columns(width: usize) -> (usize, usize) {
+    let left = width.saturating_sub(1) / 2;
+    (left, width.saturating_sub(left + 1))
 }
 
 /// The number of diff rows visible in the diff pane, used to clamp the scroll.
@@ -238,7 +255,8 @@ pub fn diff_viewport_height(area: Rect, app: &App) -> usize {
     if app.mode == crate::app::Mode::Find { h.saturating_sub(1) } else { h }
 }
 
-/// The display height (rows on screen) of each visible logical diff row, honoring wrap.
+/// The display height (rows on screen) of each painted unit, honoring wrap. One entry per
+/// unit, which is one entry per visible row in the unified layout.
 #[must_use]
 pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
     let width = inner_rect(panes(area, app).diff).width as usize;
@@ -249,18 +267,38 @@ pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
     // match what the renderer paints.
     let cards = app.comment_cards();
     let editing = editing_comment(app);
-    app.visible
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let base = row_height(r, gutter_w, width, app.wrap);
-            let card: usize = cards[i]
-                .iter()
-                .filter(|&&ci| Some(ci) != editing)
-                .filter_map(|&ci| app.store.get(ci))
-                .map(|c| comment_card_lines(c, width, p).len())
-                .sum();
-            base + card
+    let sbs = app.side_by_side_active();
+    let (left_w, right_w) = if sbs { columns(width) } else { (width, 0) };
+    // A card spans the full pane width under the pair, so it is measured once per unit.
+    let card_height = |i: usize| -> usize {
+        cards[i]
+            .iter()
+            .filter(|&&ci| Some(ci) != editing)
+            .filter_map(|&ci| app.store.get(ci))
+            .map(|c| comment_card_lines(c, width, p).len())
+            .sum()
+    };
+    app.diff_units()
+        .into_iter()
+        .map(|unit| {
+            // A fold spans the full width in either layout, so it measures against `width`.
+            if unit.anchor().is_some_and(|i| !app.visible[i].is_content()) {
+                return 1;
+            }
+            let half = |slot: Option<usize>, w: usize| {
+                slot.map_or(0, |i| row_height(&app.visible[i], gutter_w, w, app.wrap))
+            };
+            let base = if sbs {
+                half(unit.left, left_w).max(half(unit.right, right_w))
+            } else {
+                half(unit.left, width)
+            };
+            // Both halves of a pair may carry comments; each card shows once.
+            let mut card = unit.left.map_or(0, card_height);
+            if sbs && unit.right != unit.left {
+                card += unit.right.map_or(0, card_height);
+            }
+            base.max(1) + card
         })
         .collect()
 }
@@ -902,9 +940,11 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let gutter_w = gutter_for(&app.diff);
+    let sbs = app.side_by_side_active();
+    let (left_w, right_w) = if sbs { columns(width) } else { (width, 0) };
     let layout = RowLayout {
         gutter_w,
-        width,
+        width: left_w,
         h_scroll: app.h_scroll,
         wrap: app.wrap,
         focused: app.focus == Focus::Diff,
@@ -913,7 +953,10 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
             .find
             .as_ref()
             .map(|f| (f.query.as_str(), crate::app::find_case_sensitive(&f.query))),
+        // The left column numbers the old version; unified and the right column number the new.
+        numbering: if sbs { Numbering::Old } else { Numbering::New },
     };
+    let right_layout = RowLayout { width: right_w, numbering: Numbering::New, ..layout };
     let commented = app.commented_lines();
     let cards = app.comment_cards();
     let editing = editing_comment(app);
@@ -923,32 +966,55 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     // One logical row → its 1+ wrapped display lines, then any saved-comment cards anchored
     // to it. The cursor/selection apply to the code line's display rows, not the cards. The
     // card of a comment being edited is hidden — its edit box stands in for it.
-    let row_lines = |i: usize| -> Vec<Line> {
-        let state = RowState {
-            // The cursor row is always marked, dimmed while the pane is unfocused, exactly as
-            // the file list marks its own (`specs/input.md`). A hunk step driven from the list
-            // moves this cursor, so hiding it would leave the jump with nothing to show.
-            commented: commented.contains(&i),
-            cursor: i == app.diff_cursor,
-            selected: selecting && i >= lo && i <= hi,
-            reviewed: app.reviewed_line(i),
+    let state_of = |i: usize| RowState {
+        // The cursor row is always marked, dimmed while the pane is unfocused, exactly as
+        // the file list marks its own (`specs/input.md`). A hunk step driven from the list
+        // moves this cursor, so hiding it would leave the jump with nothing to show.
+        commented: commented.contains(&i),
+        cursor: i == app.diff_cursor,
+        selected: selecting && i >= lo && i <= hi,
+        reviewed: app.reviewed_line(i),
+    };
+    let card_lines = |i: usize| -> Vec<Line> {
+        cards[i]
+            .iter()
+            .filter(|&&ci| Some(ci) != editing)
+            .filter_map(|&ci| app.store.get(ci))
+            .flat_map(|c| comment_card_lines(c, width, p))
+            .collect()
+    };
+    let units = app.diff_units();
+    // One unit → its code lines, then any saved-comment cards anchored to it. The cursor and
+    // selection apply to the code lines, not the cards. The card of a comment being edited is
+    // hidden: its edit box stands in for it.
+    let unit_lines = |u: usize| -> Vec<Line> {
+        let unit = units[u];
+        // A fold spans the full pane width in either layout.
+        if let Some(i) = unit.anchor().filter(|&i| !app.visible[i].is_content()) {
+            let full = RowLayout { width, numbering: Numbering::New, ..layout };
+            return render_row(&app.visible[i], full, state_of(i));
+        }
+        let mut lines = if sbs {
+            let left = unit.left.map(|i| render_row(&app.visible[i], layout, state_of(i)));
+            let right = unit.right.map(|i| render_row(&app.visible[i], right_layout, state_of(i)));
+            join_columns(left, right, left_w, right_w, p)
+        } else {
+            unit.left.map(|i| render_row(&app.visible[i], layout, state_of(i))).unwrap_or_default()
         };
-        let mut lines = render_row(&app.visible[i], layout, state);
-        for &ci in &cards[i] {
-            if Some(ci) != editing
-                && let Some(c) = app.store.get(ci)
-            {
-                lines.extend(comment_card_lines(c, width, p));
-            }
+        if let Some(i) = unit.left {
+            lines.extend(card_lines(i));
+        }
+        if sbs && let Some(i) = unit.right.filter(|r| Some(*r) != unit.left) {
+            lines.extend(card_lines(i));
         }
         lines
     };
-    // Display lines for the logical rows in `range`, in order.
+    // Display lines for the units in `range`, in order.
     let display = |range: std::ops::Range<usize>| -> Vec<Line> {
-        range.flat_map(&row_lines).collect::<Vec<_>>()
+        range.flat_map(&unit_lines).collect::<Vec<_>>()
     };
 
-    let rows = app.visible.len();
+    let rows = units.len();
     if !app.composing() {
         // The find band takes the pane's bottom row while it is open (specs/find-in-file.md).
         let finding = app.mode == Mode::Find;
@@ -968,7 +1034,8 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     // Cap the box at height-1 so a comment taller than the viewport can't hide its anchor.
     let box_h = composer_height(app, width).min(height.saturating_sub(1)).max(1);
     let diff_budget = height - box_h;
-    let anchor = hi.clamp(app.diff_scroll, rows.saturating_sub(1));
+    // The box splices under the selection's last unit, so the anchor moves to unit coordinates.
+    let anchor = app.unit_of(hi).clamp(app.diff_scroll, rows.saturating_sub(1));
     let above = display(app.diff_scroll..anchor + 1);
     // Keep the anchor's last display line just above the box when `above` overflows.
     let above: Vec<Line> =
@@ -990,6 +1057,43 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     if !below.is_empty() {
         frame.render_widget(Paragraph::new(below), slots[2]);
     }
+}
+
+/// Lay two columns of already-padded lines beside each other, a `│` divider between them
+/// (specs/diff-view.md). The shorter column pads with blanks so the divider stays straight
+/// when one half wraps further than the other. An absent column paints as blanks, which is
+/// how a change with no counterpart shows an empty old or new side.
+fn join_columns(
+    left: Option<Vec<Line<'static>>>,
+    right: Option<Vec<Line<'static>>>,
+    left_w: usize,
+    right_w: usize,
+    p: &Palette,
+) -> Vec<Line<'static>> {
+    let left = left.unwrap_or_default();
+    let right = right.unwrap_or_default();
+    let height = left.len().max(right.len()).max(1);
+    (0..height)
+        .map(|k| {
+            // The divider takes the row's own fill, so a cursor or selection highlight runs
+            // unbroken across both columns instead of showing a gap down the middle.
+            let fill = left.get(k).or_else(|| right.get(k)).map_or(Style::default(), |l| l.style);
+            let divider = Span::styled("│", fill.fg(p.overlay0));
+            let mut spans = flatten_line(left.get(k), left_w);
+            spans.push(divider);
+            spans.extend(flatten_line(right.get(k), right_w));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// One column's line as spans, its line-level style folded into each span so the halves can
+/// share a screen row (a `Line` style would repaint the whole row). `None` pads to `width`.
+fn flatten_line(line: Option<&Line<'static>>, width: usize) -> Vec<Span<'static>> {
+    let Some(line) = line else {
+        return vec![Span::raw(" ".repeat(width))];
+    };
+    line.spans.iter().map(|s| Span::styled(s.content.clone(), line.style.patch(s.style))).collect()
 }
 
 /// The line-number column width for a diff of `rows` lines.
@@ -1038,6 +1142,18 @@ struct RowLayout<'a> {
     /// The in-file find query and its smart-case flag while the band is open, so every visible
     /// row lights its matches (specs/find-in-file.md).
     find: Option<(&'a str, bool)>,
+    /// Which line number the gutter shows. The side-by-side columns each number their own
+    /// version, so a context row reads `old` on the left and `new` on the right.
+    numbering: Numbering,
+}
+
+/// Which of a row's line numbers its gutter shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Numbering {
+    /// The new number, falling back to the old: the unified gutter and the new column.
+    New,
+    /// The old number only: the side-by-side old column.
+    Old,
 }
 
 /// A row's per-row highlight state.
@@ -1056,7 +1172,7 @@ struct RowState {
 /// into `code_width`-wide rows; a continuation row carries a blank gutter so numbers
 /// stay aligned. With wrap off, the line is one row scrolled by `h_scroll`.
 fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'static>> {
-    let RowLayout { gutter_w, width, h_scroll, wrap, focused, pal, find } = layout;
+    let RowLayout { gutter_w, width, h_scroll, wrap, focused, pal, find, numbering } = layout;
     let RowState { commented, cursor, selected, reviewed } = state;
     if let Row::Fold { .. } = row {
         let label = if cursor {
@@ -1071,7 +1187,11 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         let bg = if cursor { pal.cursor_bg(focused) } else { pal.surface0 };
         return vec![line.style(Style::default().bg(bg).add_modifier(Modifier::BOLD))];
     }
-    let num = row.new_no().or_else(|| row.old_no()).map_or(String::new(), |n| n.to_string());
+    let num = match numbering {
+        Numbering::New => row.new_no().or_else(|| row.old_no()),
+        Numbering::Old => row.old_no(),
+    }
+    .map_or(String::new(), |n| n.to_string());
     // A commented line's number takes the peach comment accent; others sit a step brighter
     // than the dim chrome so they stay legible while read.
     let num_color = if commented { pal.peach } else { pal.overlay1 };
@@ -1447,6 +1567,9 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::Search => (hint(K::Search), "search"),
         A::Find => (hint(K::Find), "find"),
         A::Wrap => (hint(K::Wrap), "wrap"),
+        A::SideBySide => {
+            (hint(K::SideBySide), if app.side_by_side { "unified" } else { "columns" })
+        }
         A::FindStep => ("↑↓".into(), "match"),
         A::FlipSearchMode => {
             // The label names the destination mode: `code` from Files, `files` from Code.

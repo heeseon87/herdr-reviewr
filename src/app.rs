@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::diff::{DiffCache, FileDiff, Row, View};
+use crate::diff::{DiffCache, FileDiff, FileState, Row, View};
 use crate::export::{ExportTarget, format_all};
 use crate::file_list::{self, Annotation, Entry, RowKind};
 use crate::forge;
@@ -22,6 +22,10 @@ use crate::model::{Comment, CommentStore, Scope, Side};
 use crate::theme::{self, Palette};
 
 /// Navigator shares and bounds, as percentages of the body's split axis.
+/// The narrowest diff pane that paints two columns. Below it the pane paints unified and keeps
+/// the reviewer's preference (specs/diff-view.md).
+const MIN_SIDE_BY_SIDE_WIDTH: usize = 60;
+
 const DEFAULT_SIDE_PCT: u16 = 32;
 const DEFAULT_STACK_PCT: u16 = 25;
 const MIN_NAVIGATOR_PCT: u16 = 15;
@@ -324,6 +328,9 @@ pub enum FooterAction {
     Preview,
     NavigatorPosition,
     Wrap,
+    /// Toggle the side-by-side diff columns; the label names the destination layout
+    /// (`x columns` unified, `x unified` in two columns).
+    SideBySide,
     Scope,
     Send,
     List,
@@ -427,6 +434,11 @@ pub struct App {
     pub h_scroll: usize,
     /// Whether long diff lines wrap (default) or are scrolled horizontally.
     pub wrap: bool,
+    /// The reviewer's side-by-side preference: old version left, new version right
+    /// (specs/diff-view.md). A pane too narrow paints unified without clearing this, so
+    /// widening the pane restores the two columns. `side_by_side_active()` is the honest
+    /// on-screen predicate.
+    pub side_by_side: bool,
     /// Whether the markdown preview is open for the active file tab's file. Both file tabs
     /// render it; the flag is per file tab and resets on a file change (specs/diff-view.md).
     /// Only the armed toggle — `preview_active()` is the honest on-screen predicate.
@@ -619,6 +631,7 @@ impl App {
             diff_scroll: 0,
             h_scroll: 0,
             wrap: true,
+            side_by_side: false,
             preview: false,
             preview_scroll: 0,
             preview_text: String::new(),
@@ -795,6 +808,7 @@ impl App {
                 self.toggled_dirs = std::mem::take(&mut old.toggled_dirs);
                 self.stash = std::mem::take(&mut old.stash);
                 self.wrap = old.wrap;
+                self.side_by_side = old.side_by_side;
                 self.preview = old.preview;
                 self.preview_scroll = old.preview_scroll;
                 self.preview_scrolled = old.preview_scrolled;
@@ -1114,7 +1128,9 @@ impl App {
             self.reveal_diff = true;
         }
         self.diff_cursor = clamped;
-        self.diff_scroll = self.diff_scroll.min(last);
+        // `diff_scroll` counts units (screen rows), not visible rows, so it clamps to the unit
+        // list. The two are the same length in the unified layout.
+        self.diff_scroll = self.diff_scroll.min(self.diff_units().len().saturating_sub(1));
         self.select_anchor = self.select_anchor.map(|a| a.min(last));
     }
 
@@ -1155,7 +1171,8 @@ impl App {
         // is wheeled above the viewport (fold_idx < diff_scroll), the range is empty → above 0 →
         // top half, which is correct: the inserted rows land above the viewport, so advancing
         // diff_scroll by `shift` holds the visible content in place.
-        let above: usize = heights.get(self.diff_scroll..fold_idx).map_or(0, |s| s.iter().sum());
+        let above: usize =
+            heights.get(self.diff_scroll..self.unit_of(fold_idx)).map_or(0, |s| s.iter().sum());
         let top_half = above < viewport / 2;
         self.expanded_folds.insert(anchor);
         self.rebuild_visible();
@@ -1254,6 +1271,66 @@ impl App {
         } else {
             self.h_scroll.saturating_sub(delta.unsigned_abs())
         };
+    }
+
+    /// Toggle the side-by-side layout. Inert wherever there is no old version to show: the
+    /// `All files` File view, the markdown preview, and a notice (specs/diff-view.md).
+    pub fn toggle_side_by_side(&mut self) {
+        if !self.side_by_side_available() {
+            return;
+        }
+        self.side_by_side = !self.side_by_side;
+        // The columns wrap at half width, so a horizontal offset taken at full width no longer
+        // means anything. Reset it exactly as the wrap toggle does.
+        self.h_scroll = 0;
+        // A selection made in the unified layout may span both columns, which the two-column
+        // layout does not allow. Pull its moving end back to the anchor's side, so a snippet
+        // never mixes removed and added lines (specs/diff-view.md). The toggle is the user's
+        // own input, so moving their selection here is theirs, not a world event's.
+        if let Some(a) = self.select_anchor {
+            self.diff_cursor = self.fold_clamped(a, self.diff_cursor);
+        }
+        // The cursor keeps its row. Only the scroll's unit changed, so clamp it and let the
+        // frame's reveal put the cursor back in view (specs/tui.md, every layout change).
+        self.diff_scroll = self.diff_scroll.min(self.diff_units().len().saturating_sub(1));
+        self.reveal_diff = true;
+    }
+
+    /// Whether the `side-by-side` binding does anything here: a Diff view with rows, no preview.
+    #[must_use]
+    pub fn side_by_side_available(&self) -> bool {
+        self.diff.view == crate::diff::View::Diff
+            && self.diff.state == FileState::Normal
+            && !self.visible.is_empty()
+            && !self.preview_active()
+    }
+
+    /// Whether two columns actually paint: the reviewer asked for them, the view supports them,
+    /// and the pane is wide enough. A narrow pane paints unified and keeps the preference, so
+    /// widening it restores the columns without a keypress (specs/diff-view.md).
+    #[must_use]
+    pub fn side_by_side_active(&self) -> bool {
+        self.side_by_side
+            && self.side_by_side_available()
+            && self.pane_width.get() >= MIN_SIDE_BY_SIDE_WIDTH
+    }
+
+    /// The screen rows the read pane paints, one per `Unit` (`specs/diff-view.md`). Pure in
+    /// `visible` and the active layout, so it is recomputed rather than cached: the per-frame
+    /// wrap pass over the same rows already dominates this cost.
+    #[must_use]
+    pub fn diff_units(&self) -> Vec<crate::diff::Unit> {
+        crate::diff::pair_rows(&self.visible, self.side_by_side_active())
+    }
+
+    /// The unit index holding visible row `i`, the coordinate `diff_scroll` and the per-row
+    /// height table use. The unified layout maps a row to itself.
+    #[must_use]
+    pub fn unit_of(&self, i: usize) -> usize {
+        if !self.side_by_side_active() {
+            return i;
+        }
+        self.diff_units().iter().position(|u| u.left == Some(i) || u.right == Some(i)).unwrap_or(0)
     }
 
     /// Toggle line wrap; reset the horizontal scroll, which only applies with wrap off.
@@ -1631,7 +1708,7 @@ impl App {
             self.diff_scroll = 0;
             return;
         }
-        let cursor = self.diff_cursor.min(self.visible.len() - 1);
+        let cursor = self.unit_of(self.diff_cursor.min(self.visible.len() - 1));
         self.diff_scroll = keep_in_view(cursor, self.diff_scroll, heights, viewport);
     }
 
@@ -2336,14 +2413,19 @@ impl App {
     /// Clamp `target` so the inclusive range from `anchor` to `target` crosses no fold: a
     /// selection treats a fold as a hard boundary, so its line range and snippet always agree
     /// (never bracketing hidden lines the snippet omits). Stops the moving end shy of the fold.
+    ///
+    /// While side-by-side is on, a column change is a boundary too: a selection runs over one
+    /// side only, so its export snippet stays a single `+`/`−` run (specs/diff-view.md).
     fn fold_clamped(&self, anchor: usize, target: usize) -> usize {
+        let anchor_side = self.visible.get(anchor).map(row_side);
+        let boundary = |i: usize| {
+            !self.visible[i].is_content()
+                || (self.side_by_side_active() && Some(row_side(&self.visible[i])) != anchor_side)
+        };
         if target > anchor {
-            (anchor + 1..=target).find(|&i| !self.visible[i].is_content()).map_or(target, |i| i - 1)
+            (anchor + 1..=target).find(|&i| boundary(i)).map_or(target, |i| i - 1)
         } else {
-            (target..anchor)
-                .rev()
-                .find(|&i| !self.visible[i].is_content())
-                .map_or(target, |i| i + 1)
+            (target..anchor).rev().find(|&i| boundary(i)).map_or(target, |i| i + 1)
         }
     }
 
@@ -3665,6 +3747,11 @@ impl App {
             out.push((A::Find, Go));
         }
         out.push((A::Wrap, Go));
+        // The two-column toggle shows only where it works, so the bar never lists a dead key
+        // (specs/diff-view.md).
+        if self.side_by_side_available() {
+            out.push((A::SideBySide, Go));
+        }
         if !self.store.is_empty() {
             out.push((A::List, Go));
             out.push((A::Copy, Go));
@@ -3883,6 +3970,16 @@ fn worktree_content(repo: &std::path::Path, path: &str) -> String {
     std::fs::read(repo.join(path))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default()
+}
+
+/// The column a row belongs to in the side-by-side layout, in the same terms a comment
+/// anchor uses: `Old` for a purely removed line, `New` for everything else
+/// (`specs/review-model.md`). A selection may not cross this boundary.
+fn row_side(row: &Row) -> Side {
+    match row {
+        Row::Deletion { .. } => Side::Old,
+        _ => Side::New,
+    }
 }
 
 fn line_in(c: &Comment, row: &Row) -> bool {

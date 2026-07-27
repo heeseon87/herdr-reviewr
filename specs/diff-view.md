@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-24
-Last edited: 2026-07-20
+Last edited: 2026-07-28
 ---
 
 # Diff view
@@ -123,9 +123,38 @@ Returning to source differs per view:
 - An expansion persists across refreshes of the same file. Opening another file starts collapsed. An edit that reshapes the fold may re-collapse it.
 - Expanding keeps the viewport still: a fold in the top half grows upward, one in the bottom half grows downward.
 
+### Side-by-side layout
+
+The Diff view paints one unified column by default. The `side-by-side` binding (default `x`) puts the old version in a left column and the new version in a right column, each with its own gutter. A deletion and the insertion that replaced it sit on the same screen row, so a one-word edit reads as one line, not two.
+
+```
+ 12   def resolve(self, name):     │ 12   def resolve(self, name):
+ 13 ▌ from .z import w             │ 13 ▌ from .x import y
+ 14   return registry[name]        │ 14   return registry[name]
+ ⋯  30 unmodified lines
+```
+
+- Each column carries the same gutter as the unified view: a line number plus a one-cell change bar.
+- A change row with no counterpart leaves the other column empty. The empty half paints no gutter and no number.
+- A `context` row paints in both columns, with the old number left and the new number right.
+- A `fold` spans the full width, one row, exactly as in the unified view.
+- Wrapping applies per column, at that column's own width. Horizontal scroll is one shared offset.
+
+The layout is a place-state toggle, so it holds across refreshes and survives a tab switch like the wrap choice. Restarting reviewr returns to the config's `--side-by-side` value.
+
+The reviewer's place survives the toggle:
+
+- The cursor stays on the same line. Scroll clamps to the new geometry.
+- A selection runs over one side only, so its export snippet stays a single `+`/`−` run. Extending it onto the other side is not possible, and turning the layout on pulls a selection that already spanned both columns back to its anchor's side.
+- A comment card and the comment input span the full pane width, under the row they anchor to.
+
+The layout degrades rather than crowds. Below 60 columns of pane width, the pane paints unified and keeps the reviewer's choice, so widening the pane restores side-by-side without a keypress.
+
+The toggle is inert in three places: the `All files` File view, the markdown preview, and a `binary` or `too_large` notice. None of them has an old version to show.
+
 ### Wrapping and the gutter
 
-- The diff is one unified column: removed lines, then added lines, full width, one gutter.
+- The unified layout is one column: removed lines, then added lines, full width, one gutter.
 - Long lines wrap by default, at word boundaries. A word wider than the column hard-breaks. A toggle switches to horizontal scroll (`←`/`→`), with the gutter pinned.
 - A wrapped continuation row has a blank gutter and drops the break's leading space.
 - A commented line shows its line number in the comment color. The change bar keeps its own color.
@@ -139,10 +168,11 @@ Returning to source differs per view:
 
 ### Config
 
-| flag              | default      | meaning                                    |
-| ----------------- | ------------ | ------------------------------------------- |
-| `--theme <name>`  | `catppuccin` | the theme, chrome and syntax (`theme.md`)   |
-| `--wrap on\|off`  | `on`         | whether long lines wrap on open             |
+| flag                    | default      | meaning                                    |
+| ----------------------- | ------------ | ------------------------------------------- |
+| `--theme <name>`        | `catppuccin` | the theme, chrome and syntax (`theme.md`)   |
+| `--wrap on\|off`        | `on`         | whether long lines wrap on open             |
+| `--side-by-side on\|off`| `off`        | whether the Diff view opens in two columns  |
 
 ## Failure semantics
 
@@ -156,7 +186,8 @@ The viewer is read-only and recomputed on every refresh. It degrades rather than
 
 ## Non-goals
 
-- No alternate diff layouts. One unified column, a side-by-side split is roadmap.
+- No alternate diff layouts beyond unified and side-by-side. No inline-word-only or three-way layout.
+- No per-file layout memory. The side-by-side choice is one session-wide toggle.
 - No editing, staging, or reverting from the viewer.
 - No line-number rebasing of comments. `review-model.md` owns comment anchoring, via the snippet.
 

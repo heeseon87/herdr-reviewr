@@ -2876,7 +2876,7 @@ fn fixed_keys_survive_rebinding() {
     let r = edited_repo();
     let mut app = app_on(&r);
     let keymap = Keymap::resolve(&[
-        (Action::Down, vec![Key::plain('x')]),
+        (Action::Down, vec![Key::plain('g')]),
         (Action::Up, vec![Key::plain('z')]),
     ])
     .unwrap();
@@ -3185,12 +3185,12 @@ fn the_comments_list_acts_through_the_same_bindings() {
     let r = edited_repo();
     let mut app = app_on(&r);
     comment_on(&mut app, '+', "note");
-    let keymap = Keymap::resolve(&[(Action::Delete, vec![Key::plain('x')])]).unwrap();
+    let keymap = Keymap::resolve(&[(Action::Delete, vec![Key::plain('z')])]).unwrap();
 
     app.open_list();
     press(&mut app, &keymap, KeyCode::Char('d'));
     assert_eq!(app.store.len(), 1, "the replaced default is inert in the list too");
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('z'));
     assert!(app.store.is_empty(), "the rebound `delete` acts on the highlighted row");
 }
 
@@ -3751,6 +3751,149 @@ fn the_worker_coalesces_queued_jobs_keeping_their_flags() {
     drop(job_tx);
     assert!(res_rx.recv().is_err(), "exactly one completion lands for the coalesced pair");
     worker.join().unwrap();
+}
+
+// --- Side-by-side layout (specs/diff-view.md) ------------------------------------------
+
+/// A repo whose one edit replaces a line, so the diff pairs a deletion with an insertion.
+fn replaced_line_repo() -> Repo {
+    let r = Repo::init();
+    r.write("s.rs", "before\nOLD\nafter\n");
+    r.commit_all("init");
+    r.write("s.rs", "before\nNEW\nafter\n");
+    r
+}
+
+/// An app on a wide pane with the diff focused, as the frame loop leaves it: the pane width is
+/// noted before any geometry, which is what `side_by_side_active` reads.
+fn wide_app(r: &Repo) -> App {
+    let mut app = app_on(r);
+    app.focus = Focus::Diff;
+    app.note_diff_width(herdr_reviewr::ui::diff_inner_width(Rect::new(0, 0, 140, 40), &app));
+    app
+}
+
+#[test]
+fn the_side_by_side_toggle_keeps_the_cursor_on_its_line() {
+    let r = replaced_line_repo();
+    let mut app = wide_app(&r);
+    let deletion = app.visible.iter().position(|row| row.marker() == '-').unwrap();
+    app.diff_cursor = deletion;
+
+    app.toggle_side_by_side();
+    assert!(app.side_by_side_active(), "the pane is wide enough for two columns");
+    assert_eq!(app.diff_cursor, deletion, "the cursor stays on the same line");
+
+    app.toggle_side_by_side();
+    assert_eq!(app.diff_cursor, deletion, "and comes back unmoved");
+}
+
+#[test]
+fn a_unit_index_equals_its_row_index_in_the_unified_layout() {
+    let r = replaced_line_repo();
+    let app = app_on(&r);
+    assert_eq!(app.diff_units().len(), app.visible.len());
+    for i in 0..app.visible.len() {
+        assert_eq!(app.unit_of(i), i, "unified scroll and height indices are row indices");
+    }
+}
+
+#[test]
+fn side_by_side_pairs_the_replaced_line_into_one_unit() {
+    let r = replaced_line_repo();
+    let mut app = wide_app(&r);
+    app.toggle_side_by_side();
+
+    let deletion = app.visible.iter().position(|row| row.marker() == '-').unwrap();
+    let insertion = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    assert_eq!(
+        app.unit_of(deletion),
+        app.unit_of(insertion),
+        "the old and new versions share one screen row"
+    );
+    assert!(app.diff_units().len() < app.visible.len(), "pairing shortens the painted rows");
+}
+
+#[test]
+fn a_side_by_side_selection_never_crosses_into_the_other_column() {
+    let r = replaced_line_repo();
+    let mut app = wide_app(&r);
+    app.toggle_side_by_side();
+
+    let deletion = app.visible.iter().position(|row| row.marker() == '-').unwrap();
+    let insertion = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    app.diff_cursor = deletion;
+    app.drag_select_to(insertion);
+
+    let (lo, hi) = app.selection_range();
+    assert_eq!((lo, hi), (deletion, deletion), "the drag stops shy of the new column");
+
+    // Unified has no columns, so the same drag spans both lines.
+    app.toggle_side_by_side();
+    app.select_anchor = None;
+    app.diff_cursor = deletion;
+    app.drag_select_to(insertion);
+    assert_eq!(app.selection_range(), (deletion, insertion), "unified selects across both");
+
+    // Turning the columns back on pulls that selection back to its anchor's side, so no
+    // snippet ever mixes a removed and an added line.
+    app.toggle_side_by_side();
+    assert_eq!(app.selection_range(), (deletion, deletion), "the toggle collapses it to one side");
+}
+
+#[test]
+fn the_side_by_side_key_is_text_while_composing() {
+    let r = replaced_line_repo();
+    let mut app = wide_app(&r);
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 140, 40);
+    app.diff_cursor = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    app.start_comment();
+
+    handle_key(&mut app, KeyEvent::from(KeyCode::Char('x')), area, &keymap).unwrap();
+    assert_eq!(app.input, "x", "the binding's character is draft text, not a layout toggle");
+    assert!(!app.side_by_side, "the layout did not change under the composer");
+}
+
+#[test]
+fn a_blank_added_line_still_occupies_one_screen_row() {
+    use herdr_reviewr::ui;
+    let r = Repo::init();
+    r.write("b.rs", "one\n");
+    r.commit_all("init");
+    r.write("b.rs", "one\n\ntwo\n"); // a blank added line
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let area = Rect::new(0, 0, 140, 40);
+
+    // A zero-height row would be unreachable by the hit-test and shift every index below it.
+    let heights = ui::diff_row_heights(&app, area);
+    assert!(heights.iter().all(|&h| h >= 1), "every painted unit is at least one row: {heights:?}");
+    app.note_diff_width(ui::diff_inner_width(area, &app));
+    app.toggle_side_by_side();
+    let heights = ui::diff_row_heights(&app, area);
+    assert!(heights.iter().all(|&h| h >= 1), "and in two columns too: {heights:?}");
+}
+
+#[test]
+fn a_click_in_the_new_column_lands_on_the_insertion() {
+    use herdr_reviewr::ui;
+    let r = replaced_line_repo();
+    let mut app = wide_app(&r);
+    app.toggle_side_by_side();
+    let area = Rect::new(0, 0, 140, 40);
+
+    let deletion = app.visible.iter().position(|row| row.marker() == '-').unwrap();
+    let insertion = app.visible.iter().position(|row| row.marker() == '+').unwrap();
+    let heights = ui::diff_row_heights(&app, area);
+    // The screen row of the pair, found by the hit-test itself so the assertion does not
+    // hard-code the header's height.
+    let y = (0..40)
+        .find(|&y| ui::hit_diff(area, &app, 2, y, &heights, app.diff_scroll) == Some(deletion))
+        .expect("the old version is hit-testable in the left column");
+    let inner_w = ui::diff_inner_width(area, &app) as u16;
+    let right = ui::hit_diff(area, &app, inner_w - 2, y, &heights, app.diff_scroll);
+    assert_eq!(right, Some(insertion), "the same row's right column claims the new version");
 }
 
 // --- Search overlay (specs/search.md) --------------------------------------------------

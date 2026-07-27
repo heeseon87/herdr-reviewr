@@ -17,19 +17,23 @@ pub struct Config {
     pub theme: Option<String>,
     /// `Some(false)` when `--wrap off` is passed; `None` keeps the default (wrap on).
     pub wrap: Option<bool>,
+    /// `Some(true)` when `--side-by-side on` is passed; `None` keeps the default (unified).
+    pub side_by_side: Option<bool>,
 }
 
 impl Config {
     /// Parse `args` (the process arguments *after* argv\[0\]).
     ///
     /// Recognises `--poll <ms>` (min 200, default 2000), `--base <ref>`,
-    /// `--theme <name>`, and `--wrap on|off`; the first non-flag token is the repo path.
+    /// `--theme <name>`, `--wrap on|off`, and `--side-by-side on|off`; the first non-flag
+    /// token is the repo path.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Self {
         let mut repo: Option<PathBuf> = None;
         let mut poll_ms: u64 = 2000;
         let mut base: Option<String> = None;
         let mut theme: Option<String> = None;
         let mut wrap: Option<bool> = None;
+        let mut side_by_side: Option<bool> = None;
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -41,13 +45,21 @@ impl Config {
                 "--base" => base = it.next(),
                 "--theme" => theme = it.next(),
                 "--wrap" => wrap = it.next().map(|v| v != "off"),
+                "--side-by-side" => side_by_side = it.next().map(|v| v != "off"),
                 other if !other.starts_with('-') => repo = Some(PathBuf::from(other)),
                 _ => {}
             }
         }
         let repo =
             repo.or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("."));
-        Self { repo, poll: Duration::from_millis(poll_ms.max(200)), base, theme, wrap }
+        Self {
+            repo,
+            poll: Duration::from_millis(poll_ms.max(200)),
+            base,
+            theme,
+            wrap,
+            side_by_side,
+        }
     }
 
     /// Parse from the real process arguments.
@@ -862,14 +874,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[keybindings]\ncomment = [\"c\", \"ㅊ\"]\nsend = [\"x\"]\n",
+            "[keybindings]\ncomment = [\"c\", \"ㅊ\"]\nsend = [\"z\"]\n",
         )
         .unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         let keymap = config.keymap();
         assert_eq!(keymap.action_for(Key::plain('ㅊ')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
-        assert_eq!(keymap.action_for(Key::plain('x')), Some(Action::Send));
+        assert_eq!(keymap.action_for(Key::plain('z')), Some(Action::Send));
         assert_eq!(keymap.action_for(Key::plain('s')), None, "a binding replaces its defaults");
         assert_eq!(keymap.action_for(Key::plain('S')), None);
         assert_eq!(keymap.action_for(Key::plain('v')), Some(Action::Select), "unbound keep theirs");

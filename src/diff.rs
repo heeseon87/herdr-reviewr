@@ -110,6 +110,92 @@ impl Row {
     }
 }
 
+/// One screen row of the read pane: which visible row paints in each column.
+///
+/// The unified layout is the identity case, one row per unit in the left slot. Side-by-side
+/// pairs a deletion with the insertion that replaced it, so a one-word edit reads as one
+/// screen row (specs/diff-view.md). Both slots hold the same index on a context row, which
+/// paints its old number left and its new number right. A `Fold` occupies the left slot alone
+/// and the renderer spans it full width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Unit {
+    pub left: Option<usize>,
+    pub right: Option<usize>,
+}
+
+impl Unit {
+    /// The visible row this unit anchors: the left slot, else the right.
+    pub fn anchor(self) -> Option<usize> {
+        self.left.or(self.right)
+    }
+
+    /// The visible row in `side`, falling back to the other slot when that column is empty,
+    /// so a click on filler still lands on the row it sits beside.
+    pub fn pick(self, column: Column) -> Option<usize> {
+        match column {
+            Column::Left => self.left.or(self.right),
+            Column::Right => self.right.or(self.left),
+        }
+    }
+}
+
+/// Which column of a side-by-side row a screen cell belongs to. The unified layout is all `Left`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Column {
+    Left,
+    Right,
+}
+
+/// Group `rows` into the screen rows the pane paints.
+///
+/// With `side_by_side` off this is the identity mapping, one unit per row, so every consumer
+/// of unit indices behaves exactly as it did before the two-column layout existed. With it on,
+/// each run of deletions zips against the insertion run that follows it; whichever run is
+/// longer leaves one-sided units for its leftovers.
+pub fn pair_rows(rows: &[Row], side_by_side: bool) -> Vec<Unit> {
+    if !side_by_side {
+        return (0..rows.len()).map(|i| Unit { left: Some(i), right: None }).collect();
+    }
+    let mut units = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        match rows[i] {
+            Row::Deletion { .. } => {
+                let dels = run_len(rows, i, |r| matches!(r, Row::Deletion { .. }));
+                let ins_start = i + dels;
+                let ins = run_len(rows, ins_start, |r| matches!(r, Row::Insertion { .. }));
+                for k in 0..dels.max(ins) {
+                    units.push(Unit {
+                        left: (k < dels).then_some(i + k),
+                        right: (k < ins).then_some(ins_start + k),
+                    });
+                }
+                i = ins_start + ins;
+            }
+            // An insertion run with no deletions before it: the old column stays empty.
+            Row::Insertion { .. } => {
+                units.push(Unit { left: None, right: Some(i) });
+                i += 1;
+            }
+            // A context row paints in both columns; a fold spans the full width.
+            Row::Context { .. } => {
+                units.push(Unit { left: Some(i), right: Some(i) });
+                i += 1;
+            }
+            Row::Fold { .. } => {
+                units.push(Unit { left: Some(i), right: None });
+                i += 1;
+            }
+        }
+    }
+    units
+}
+
+/// The length of the run of rows from `start` that all satisfy `pred`.
+fn run_len(rows: &[Row], start: usize, pred: impl Fn(&Row) -> bool) -> usize {
+    rows[start.min(rows.len())..].iter().take_while(|r| pred(r)).count()
+}
+
 /// Whether the file renders as rows, or a notice instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileState {
@@ -549,9 +635,78 @@ fn content_hash(previous_path: Option<&str>, old: &str, new: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffCache, FileDiff, FileState, Row, View, language_of};
+    use super::{DiffCache, FileDiff, FileState, Row, Unit, View, language_of, pair_rows};
     use crate::highlight::Highlighter;
     use crate::theme;
+
+    fn ctx(n: u32) -> Row {
+        Row::Context { old_no: n, new_no: n, spans: Vec::new() }
+    }
+    fn del(n: u32) -> Row {
+        Row::Deletion { old_no: n, spans: Vec::new(), emphasis: Vec::new() }
+    }
+    fn ins(n: u32) -> Row {
+        Row::Insertion { new_no: n, spans: Vec::new(), emphasis: Vec::new() }
+    }
+
+    #[test]
+    fn unified_pairing_is_the_identity_mapping() {
+        let rows = vec![ctx(1), del(2), ins(2), Row::Fold { lines: vec![ctx(3)] }];
+        let units = pair_rows(&rows, false);
+        assert_eq!(units.len(), rows.len(), "one unit per row, so unit indices are row indices");
+        for (i, u) in units.iter().enumerate() {
+            assert_eq!(*u, Unit { left: Some(i), right: None });
+        }
+    }
+
+    #[test]
+    fn side_by_side_zips_a_deletion_run_against_the_insertion_run_after_it() {
+        // Two lines replaced by two: each pair shares one screen row.
+        let rows = vec![ctx(1), del(2), del(3), ins(2), ins(3), ctx(4)];
+        let units = pair_rows(&rows, true);
+        assert_eq!(
+            units,
+            vec![
+                Unit { left: Some(0), right: Some(0) }, // context paints in both columns
+                Unit { left: Some(1), right: Some(3) },
+                Unit { left: Some(2), right: Some(4) },
+                Unit { left: Some(5), right: Some(5) },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unpaired_change_leaves_the_other_column_empty() {
+        // One deletion, three insertions: the longer run spills into one-sided units.
+        let units = pair_rows(&[del(2), ins(2), ins(3), ins(4)], true);
+        assert_eq!(
+            units,
+            vec![
+                Unit { left: Some(0), right: Some(1) },
+                Unit { left: None, right: Some(2) },
+                Unit { left: None, right: Some(3) },
+            ]
+        );
+        // A pure deletion run works the same way, with the new column empty.
+        let units = pair_rows(&[del(2), del(3)], true);
+        assert_eq!(
+            units,
+            vec![Unit { left: Some(0), right: None }, Unit { left: Some(1), right: None }]
+        );
+    }
+
+    #[test]
+    fn an_insertion_with_no_deletion_before_it_keeps_the_old_column_empty() {
+        let units = pair_rows(&[ctx(1), ins(2)], true);
+        assert_eq!(units[1], Unit { left: None, right: Some(1) });
+    }
+
+    #[test]
+    fn a_fold_spans_the_pane_as_one_unit() {
+        let units = pair_rows(&[Row::Fold { lines: vec![ctx(1), ctx(2)] }, ins(3)], true);
+        assert_eq!(units[0], Unit { left: Some(0), right: None });
+        assert_eq!(units[0].anchor(), Some(0));
+    }
 
     /// The default theme's syntax pairing (bundled Catppuccin Mocha), for highlighter setup.
     fn mocha() -> crate::theme::SyntaxChoice {

@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-23
-Last edited: 2026-07-21
+Last edited: 2026-07-28
 ---
 
 # TUI
@@ -93,7 +93,7 @@ Every layout change preserves the focused pane and each pane's cursor or selecti
 ## Non-goals
 
 - No editing, staging, or committing from the UI.
-- No side-by-side split view. The diff is one unified column, split is roadmap.
+- No layout coupling between the navigator divider and the diff's side-by-side columns. They resize independently (`diff-view.md`).
 - No per-tab navigator position. One position applies to every tab.
 - No automatic position or content-sized navigator. Layout changes only through config, `p`, resize keys, or dragging.
 - No hidden navigator. Both panes remain present.

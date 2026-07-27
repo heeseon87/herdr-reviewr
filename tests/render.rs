@@ -1845,6 +1845,97 @@ fn the_find_band_and_match_highlight_paint() {
     assert!(highlighted, "a matched character reverses to the bright find highlight");
 }
 
+// Side-by-side layout (specs/diff-view.md).
+
+/// A repo whose one edit replaces a line, so the diff has a deletion paired with an insertion.
+fn replaced_line_app() -> App {
+    let r = Repo::init();
+    r.write("s.rs", "keep_before\nOLDWORD_HERE\nkeep_after\n");
+    r.commit_all("init");
+    r.write("s.rs", "keep_before\nNEWWORD_HERE\nkeep_after\n");
+    app_on(&r)
+}
+
+#[test]
+fn side_by_side_puts_the_old_and_new_line_on_one_screen_row() {
+    let mut app = replaced_line_app();
+    app.focus = Focus::Diff;
+    let unified = render(&app);
+    let old_row = unified.lines().position(|l| l.contains("OLDWORD_HERE")).expect("deletion");
+    let new_row = unified.lines().position(|l| l.contains("NEWWORD_HERE")).expect("insertion");
+    assert_ne!(old_row, new_row, "unified stacks the two versions on separate rows");
+
+    app.toggle_side_by_side();
+    let out = render(&app);
+    let row = out.lines().find(|l| l.contains("OLDWORD_HERE")).expect("the old version paints");
+    assert!(row.contains("NEWWORD_HERE"), "the pair shares one screen row:\n{out}");
+    // Pane border, old column, divider, new column, pane border.
+    assert!(row.matches('│').count() >= 3, "a divider separates the columns:\n{row:?}");
+    // The old version sits left of the new one.
+    assert!(
+        row.find("OLDWORD_HERE") < row.find("NEWWORD_HERE"),
+        "old version left, new version right: {row:?}"
+    );
+}
+
+#[test]
+fn each_side_by_side_column_numbers_its_own_version() {
+    let r = Repo::init();
+    // Two lines added early, so the old and new numbers of a later context line differ.
+    r.write("n.rs", "one\ntwo\n");
+    r.commit_all("init");
+    r.write("n.rs", "added_a\nadded_b\none\ntwo\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.toggle_side_by_side();
+
+    let out = render(&app);
+    let row = out.lines().find(|l| l.contains("one")).expect("the context line paints");
+    // The row reads: pane border, old column, divider, new column, pane border.
+    let cols: Vec<&str> = row.split('│').collect();
+    assert!(cols.len() >= 3, "the divider splits the two columns: {row:?}");
+    assert!(cols[1].contains(" 1 "), "the old column shows the old number: {:?}", cols[1]);
+    assert!(cols[2].contains(" 3 "), "the new column shows the new number: {:?}", cols[2]);
+}
+
+#[test]
+fn a_narrow_pane_paints_unified_and_keeps_the_preference() {
+    let mut app = replaced_line_app();
+    app.focus = Focus::Diff;
+    app.toggle_side_by_side();
+    // Wide enough: two columns paint.
+    assert!(dump(&render_size(&app, 140, 40)).contains('│'));
+
+    // Too narrow: unified paints, and the preference survives so widening restores the columns.
+    let narrow = dump(&render_size(&app, 50, 20));
+    let row = narrow.lines().find(|l| l.contains("OLDWORD_HERE")).expect("the deletion paints");
+    assert!(!row.contains("NEWWORD_HERE"), "a narrow pane degrades to unified:\n{narrow}");
+    assert!(app.side_by_side, "the reviewer's choice is kept, not cleared");
+    assert!(dump(&render_size(&app, 140, 40)).contains('│'), "widening restores the columns");
+}
+
+#[test]
+fn the_side_by_side_toggle_is_inert_where_there_is_no_old_version() {
+    let r = Repo::init();
+    r.write("a.md", "# title\n\nbody\n");
+    r.commit_all("init");
+    r.write("a.md", "# title\n\nbody edited\n");
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+
+    // The File view has no old side to show.
+    enter_tab(&mut app, Tab::AllFiles);
+    app.toggle_side_by_side();
+    assert!(!app.side_by_side, "inert in the File view");
+
+    // Nor does the markdown preview.
+    enter_tab(&mut app, Tab::Changes);
+    app.toggle_preview();
+    assert!(app.preview_active(), "the preview opened");
+    app.toggle_side_by_side();
+    assert!(!app.side_by_side, "inert in the preview");
+}
+
 // Search screen rendering (specs/search.md).
 mod search_screen_render {
     use super::{common, dump, render, render_size};

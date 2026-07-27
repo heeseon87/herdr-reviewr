@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-23
-Last edited: 2026-07-23
+Last edited: 2026-07-28
 ---
 
 # herdr-reviewr
@@ -57,7 +57,6 @@ Named so the architecture stays open to them. None is part of this design.
 
 - Reviewed-file state: marking a file reviewed and greying it in the list.
 - Hopping between the agent's changed files while browsing `All files`.
-- A side-by-side split diff view for wide panes.
 - Search on `Changes`, scoped to the changeset.
 - Live theme switching.
 
