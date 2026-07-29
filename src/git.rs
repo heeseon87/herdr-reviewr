@@ -903,6 +903,21 @@ pub fn changed_files(
     assemble(repo, &numstat, &name_status, include_untracked)
 }
 
+/// Whether the uncommitted scope has anything to show: tracked changes vs the diff base
+/// (staged or unstaged) OR untracked files — the same contents as
+/// `changed_files(Uncommitted)`, without building the full list. Decides the sidebar's opening
+/// scope: dirty ⇒ `Uncommitted` (what you're working on), clean ⇒ `Branch` (what you review once
+/// the work is committed).
+pub fn has_uncommitted_changes(repo: &Path) -> bool {
+    // `diff --quiet <base>` exits non-zero when tracked files differ from the base.
+    if !git_ok(repo, &["diff", "--quiet", &diff_base(repo)]) {
+        return true;
+    }
+    // Untracked-but-not-ignored files: `git diff` never reports these, yet the uncommitted
+    // scope lists them (assemble's untracked pass), so they count as work in progress.
+    git_line(repo, &["ls-files", "--others", "--exclude-standard"]).is_some()
+}
+
 /// The changed files between the turn baseline `tree` and the live worktree, for
 /// `last-turn`. Snapshots the worktree now and diffs tree-against-tree, so staged,
 /// unstaged, untracked, and committed-this-turn changes all show, with no phantom

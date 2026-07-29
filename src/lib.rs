@@ -115,7 +115,16 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
     // A non-repo path is not an error — the sidebar opens to an empty state and starts showing
     // changes if the directory becomes a repo (specs/herdr-host.md).
     let repo = git::toplevel(&cfg.repo).unwrap_or_else(|| cfg.repo.clone());
-    let scope = plugin_config.default_scope();
+    // The configured startup scope (upstream `default_scope`), with a local auto-open twist: when
+    // it is the default `uncommitted` but the worktree is clean, open on `branch` instead so the
+    // first screen shows something to review rather than an empty uncommitted diff. An explicitly
+    // configured scope (branch/last-turn) is always honored.
+    let configured = plugin_config.default_scope();
+    let scope = if configured == Scope::Uncommitted && !git::has_uncommitted_changes(&repo) {
+        Scope::Branch
+    } else {
+        configured
+    };
     logln!(
         "start repo={} poll={:?} base={:?} scope={}",
         repo.display(),
