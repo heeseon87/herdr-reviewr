@@ -24,6 +24,7 @@ pub enum Action {
     NavigatorPosition,
     NavigatorGrow,
     NavigatorShrink,
+    ExpandAllFolds,
     Select,
     Comment,
     Edit,
@@ -83,7 +84,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 32] = [
+const ACTIONS: [(Action, &str, &[Key]); 33] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -101,6 +102,8 @@ const ACTIONS: [(Action, &str, &[Key]); 32] = [
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
     (Action::NavigatorGrow, "navigator-grow", &[Key::plain('<')]),
     (Action::NavigatorShrink, "navigator-shrink", &[Key::plain('>')]),
+    // A local addition, on a key upstream leaves free.
+    (Action::ExpandAllFolds, "expand-all-folds", &[Key::plain('a')]),
     (Action::Select, "select", &[Key::plain('v')]),
     (Action::Comment, "comment", &[Key::plain('c')]),
     (Action::Edit, "edit", &[Key::plain('e')]),

@@ -1130,6 +1130,21 @@ impl App {
         // bottom half: leave diff_scroll — the content above the fold stays put, grow downward
     }
 
+    /// Expand every fold in the current file's diff at once, revealing all hidden context.
+    /// Like `expand_fold`, expansion is permanent for the session and scoped to this file:
+    /// `expanded_folds` is keyed by line number and cleared on a file switch (see `select_file`),
+    /// so this never leaks into the next file. A full expand shifts most rows, so instead of the
+    /// per-fold viewport math it just clamps the cursor/scroll to the rebuilt view (`settle_read`).
+    pub fn expand_all_folds(&mut self) {
+        let anchors: Vec<u32> = self.diff.rows.iter().filter_map(Row::fold_anchor).collect();
+        if anchors.is_empty() {
+            return;
+        }
+        self.expanded_folds.extend(anchors);
+        self.rebuild_visible();
+        self.settle_read();
+    }
+
     /// The old and new content of `file` for the current scope: old from `HEAD` (or the
     /// merge-base on the branch scope), new from the worktree. A rename reads its old side
     /// from `previous_path`, so the diff shows real edits, not a wholesale delete-and-add.
