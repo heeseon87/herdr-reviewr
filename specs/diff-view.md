@@ -62,6 +62,18 @@ Content rows are selectable for comments. A `fold` is not.
 - Changes group into hunks with a context margin of 3 unchanged lines.
 - A hunk prefers the boundary a reader expects over the shortest edit script. An added or removed function tends to start at its attribute or doc comment and end at its closing brace, so two neighbouring functions read as separate units. This is a preference, not a guarantee: a single-line replacement beside a longer removal can still be absorbed into it and lose its pairing.
 - A hunk's rows come in one order: every deletion, then every insertion. Word emphasis reads that order.
+
+### Ignoring whitespace
+
+The `ignore-whitespace` binding (default `W`) switches what the differ treats as equal, for the Diff view of every file. It does not change how a line paints: a row always shows the line as written, at its own indentation.
+
+- On, whitespace is stripped before two lines are compared. A re-indented line, a line whose interior spacing changed, and a whitespace-only line that became empty are all unchanged. A real edit inside a re-indented block still shows.
+- Adding or removing a blank line still shows. The line count changed, which is not a whitespace-only difference.
+- The toggle is inert in the `All files` File view, which shows one version, and on a notice or an empty diff. The footer lists the key only where it works.
+- It is a no-op while composing, so a draft's anchor never moves under it.
+- The cursor keeps its line, by side and number, across the rebuild. Where that line no longer has a row on its own side, the cursor falls to the nearest row at or past it. Expanded folds keep their anchors; one that no longer matches stays collapsed.
+- Comments are untouched. A comment's anchor line always still has a row, since ignoring whitespace only turns change rows into context rows, never removes a line.
+- Stripping whitespace also removes the indentation the hunk-boundary heuristic reads, so boundaries in this mode rest on the algorithm alone.
 - The whole file is highlighted, not each hunk. A multi-line string or comment colors correctly inside a hunk.
 - The language is detected from the path. An unknown path renders plain.
 - The diff and highlighting are cached by content. A poll that finds the file unchanged recomputes nothing.

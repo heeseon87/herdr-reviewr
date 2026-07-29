@@ -21,6 +21,7 @@ pub enum Action {
     TabPr,
     Wrap,
     SideBySide,
+    IgnoreWhitespace,
     Preview,
     NavigatorPosition,
     NavigatorGrow,
@@ -87,7 +88,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 36] = [
+const ACTIONS: [(Action, &str, &[Key]); 37] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -102,6 +103,7 @@ const ACTIONS: [(Action, &str, &[Key]); 36] = [
     (Action::TabPr, "tab-pr", &[Key::plain('3')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
     (Action::SideBySide, "side-by-side", &[Key::plain('x')]),
+    (Action::IgnoreWhitespace, "ignore-whitespace", &[Key::plain('W')]),
     (Action::Preview, "preview", &[Key::plain('m')]),
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
     (Action::NavigatorGrow, "navigator-grow", &[Key::plain('<')]),
@@ -261,6 +263,27 @@ mod tests {
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
         assert_eq!(Action::by_config_name("list-wider"), Some(Action::NavigatorGrow));
         assert_eq!(Action::by_config_name("list-narrower"), Some(Action::NavigatorShrink));
+    }
+
+    #[test]
+    fn every_default_key_is_bound_once() {
+        // `Keymap::default()` bypasses `resolve`, so the CFG-KEY-UNIQUE check never sees the
+        // defaults. A new action that reuses a taken key would otherwise shadow it silently.
+        let keymap = Keymap::default();
+        let mut seen: Vec<(Key, Action)> = Vec::new();
+        for (action, keys) in keymap.bindings() {
+            for key in keys {
+                if let Some((_, other)) = seen.iter().find(|(k, _)| k == key) {
+                    panic!(
+                        "{} is bound to both `{}` and `{}`",
+                        key.config_str(),
+                        other.name(),
+                        action.name()
+                    );
+                }
+                seen.push((*key, *action));
+            }
+        }
     }
 
     #[test]

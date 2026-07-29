@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use herdr_reviewr::diff::DiffCache;
+use herdr_reviewr::diff::{DiffCache, Whitespace};
 use herdr_reviewr::git;
 use herdr_reviewr::highlight::Highlighter;
 use herdr_reviewr::model::Scope;
@@ -130,19 +130,19 @@ fn main() {
                 let mut cache = DiffCache::new();
                 let old = git::file_content(&repo, "HEAD", &path);
                 let new = std::fs::read_to_string(repo.join(&path)).unwrap_or_default();
-                cache.get(path.clone(), None, &old, &new, &hl);
+                cache.get(path.clone(), None, &old, &new, &hl, Whitespace::Show);
             }),
         );
         let mut warm = DiffCache::new();
         let old0 = git::file_content(&repo, "HEAD", &path);
         let new0 = std::fs::read_to_string(repo.join(&path)).unwrap_or_default();
-        warm.get(path.clone(), None, &old0, &new0, &hl);
+        warm.get(path.clone(), None, &old0, &new0, &hl, Whitespace::Show);
         row(
             "diff open, Changes WARM (same file re-poll)",
             sample(5, || {
                 let old = git::file_content(&repo, "HEAD", &path);
                 let new = std::fs::read_to_string(repo.join(&path)).unwrap_or_default();
-                warm.get(path.clone(), None, &old, &new, &hl);
+                warm.get(path.clone(), None, &old, &new, &hl, Whitespace::Show);
             }),
         );
     } else {

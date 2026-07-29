@@ -3788,6 +3788,142 @@ fn the_side_by_side_toggle_keeps_the_cursor_on_its_line() {
     assert_eq!(app.diff_cursor, deletion, "and comes back unmoved");
 }
 
+/// A file whose diff is one real edit buried in a wholesale re-indent: the case the whitespace
+/// toggle exists for.
+fn reindented_repo() -> Repo {
+    let r = Repo::init();
+    r.write("s.rs", "fn f() {\n    let x = 1;\n    g(x);\n    h(x);\n}\n");
+    r.commit_all("init");
+    r.write("s.rs", "fn f() {\n        let x = 2;\n        g(x);\n        h(x);\n}\n");
+    r
+}
+
+#[test]
+fn the_whitespace_toggle_hides_a_reindent_and_keeps_the_cursor_on_its_line() {
+    let r = reindented_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let changed = |app: &App| app.visible.iter().filter(|row| row.marker() != ' ').count();
+    assert_eq!(changed(&app), 6, "every re-indented line reads as a change");
+
+    // Park the cursor on the line that really changed, by its source line number.
+    app.diff_cursor = app.visible.iter().position(|row| row.text().contains("let x = 2")).unwrap();
+    let line = app.visible[app.diff_cursor].new_no();
+
+    app.toggle_whitespace();
+    assert_eq!(changed(&app), 2, "only the real edit survives");
+    assert_eq!(
+        app.visible[app.diff_cursor].new_no(),
+        line,
+        "the cursor holds its source line across the rebuild, not its row index",
+    );
+
+    app.toggle_whitespace();
+    assert_eq!(changed(&app), 6, "and the re-indent comes back");
+}
+
+#[test]
+fn a_comment_survives_the_whitespace_toggle_both_ways() {
+    let r = reindented_repo();
+    let mut app = app_on(&r);
+    // Comment on a deletion, the row kind that becomes context once whitespace is ignored.
+    comment_on(&mut app, '-', "why the re-indent?");
+    let authored = app.store.iter().cloned().collect::<Vec<_>>();
+    assert_eq!(authored.len(), 1);
+
+    app.toggle_whitespace();
+    assert_eq!(
+        app.store.iter().cloned().collect::<Vec<_>>(),
+        authored,
+        "the store is untouched by a rebuild (O3/O4)",
+    );
+    let c = app.store.get(0).unwrap().clone();
+    assert!(!app.is_stale(&c), "the file is in the changeset, so the comment is not stale");
+    assert!(
+        app.visible.iter().any(|row| {
+            let no = if c.side == Side::Old { row.old_no() } else { row.new_no() };
+            no.is_some_and(|n| c.start <= n && n <= c.end)
+        }),
+        "its anchor line still has a row to paint against: {c:?}",
+    );
+
+    app.toggle_whitespace();
+    assert_eq!(
+        app.store.iter().cloned().collect::<Vec<_>>(),
+        authored,
+        "and again on the way back",
+    );
+}
+
+#[test]
+fn the_whitespace_toggle_lands_the_cursor_near_its_line_even_across_a_fold() {
+    // A long file where every changed line becomes context under the toggle, so the whole middle
+    // collapses into folds. `visible` then holds no row for the cursor's line, and the O6 fallback
+    // (nearest surviving target, then clamp) has to keep the cursor somewhere sane rather than
+    // snapping to row 0 or off the end.
+    use std::fmt::Write as _;
+    let r = Repo::init();
+    let (mut old, mut new) = (String::new(), String::new());
+    for i in 0..60 {
+        let _ = writeln!(old, "    line {i}");
+        let _ = writeln!(new, "        line {i}"); // re-indent only
+    }
+    r.write("a.rs", &old);
+    r.commit_all("init");
+    r.write("a.rs", &new);
+    let mut app = app_on(&r);
+    app.reload().unwrap();
+    app.focus = Focus::Diff;
+
+    // The insertion for line 40, not the deletion that also carries that text.
+    let target = app
+        .visible
+        .iter()
+        .position(|row| row.marker() == '+' && row.text().contains("line 40"))
+        .unwrap();
+    app.diff_cursor = target;
+    let line = app.visible[target].new_no().unwrap();
+
+    app.toggle_whitespace();
+    assert!(
+        app.visible.iter().all(|row| row.marker() == ' '),
+        "a pure re-indent leaves no change rows",
+    );
+    // With nothing changed, the whole file collapses to one fold, so no visible row carries the
+    // cursor's line. Identity misses, the nearest-at-or-past search misses too, and the clamp
+    // takes it: the cursor sits on the fold, in range, with the reveal armed.
+    assert!(app.diff_cursor < app.visible.len(), "the cursor stays in range");
+    let landed = &app.visible[app.diff_cursor];
+    let landed_line = landed.new_no().or_else(|| landed.old_no());
+    assert!(
+        landed.hidden() > 0 || landed_line.is_some_and(|n| n >= line),
+        "landed on line {landed_line:?} (hidden {}), looking for line {line}",
+        landed.hidden(),
+    );
+    assert!(app.reveal_diff, "the frame scrolls wherever the cursor ended up");
+}
+
+#[test]
+fn the_whitespace_toggle_is_inert_while_composing() {
+    let mut app = composing_app();
+    let before = app.visible.clone();
+    app.toggle_whitespace();
+    assert_eq!(app.visible, before, "a draft's rows never move under it (specs/diff-view.md)");
+}
+
+#[test]
+fn the_whitespace_toggle_shows_in_the_footer_only_where_it_works() {
+    use herdr_reviewr::app::Tab;
+    let r = reindented_repo();
+    let mut app = app_on(&r);
+    let listed =
+        |app: &App| app.footer_bands().iter().any(|&(a, _)| a == FooterAction::IgnoreWhitespace);
+    assert!(listed(&app), "a Diff view with rows offers the toggle");
+
+    enter_tab(&mut app, Tab::AllFiles);
+    assert!(!listed(&app), "the File view has one version, so no whitespace to hide");
+}
+
 #[test]
 fn a_unit_index_equals_its_row_index_in_the_unified_layout() {
     let r = replaced_line_repo();

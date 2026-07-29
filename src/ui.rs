@@ -1570,6 +1570,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::SideBySide => {
             (hint(K::SideBySide), if app.side_by_side { "unified" } else { "columns" })
         }
+        A::IgnoreWhitespace => (
+            hint(K::IgnoreWhitespace),
+            if app.whitespace == crate::diff::Whitespace::Ignore { "show ws" } else { "hide ws" },
+        ),
         A::FindStep => ("↑↓".into(), "match"),
         A::FlipSearchMode => {
             // The label names the destination mode: `code` from Files, `files` from Code.

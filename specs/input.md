@@ -37,6 +37,7 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | —                                                        | open a link in rendered markdown            | —                                           | click the link                |
 | `wrap`                                                   | toggle line wrap                            | `w`                                         | —                             |
 | `side-by-side`                                           | toggle the two-column diff (`diff-view.md`) | `x`                                         | —                             |
+| `ignore-whitespace`                                      | toggle ignoring whitespace (`diff-view.md`) | `W`                                         | —                             |
 | `preview`                                                | toggle the markdown preview                 | `m`                                         | —                             |
 | `navigator-position`                                     | move the navigator clockwise                | `p`                                         | —                             |
 | `navigator-grow` / `navigator-shrink`                    | grow / shrink the navigator                 | `<` / `>`                                   | drag the divider              |
@@ -111,7 +112,7 @@ right of the `do` row.
 
 ```
  do    e edit · d delete · n/N jump · s send 2                                ?
- go    u/b/t scope · / search · ctrl+f find · w wrap · x columns · l list · y copy · r refresh · 1·2·3 tabs
+ go    u/b/t scope · / search · ctrl+f find · w wrap · x columns · W hide ws · l list · y copy · r refresh · 1·2·3 tabs
        tab files · p position · q quit
  move  j k · ] [ hunk · f F file · PageUp PageDown
 ```
@@ -136,7 +137,7 @@ The `?` expansion:
 
 - It lists every shortcut applicable in the current context that is not already on row 1, wrapped
   below row 1 in three labeled bands, each a dim label then its keys. `do`: the cursor's actions.
-  `go`: the keys that work anywhere — scope, search, find, wrap, the side-by-side toggle, the comments list, copy, refresh, the
+  `go`: the keys that work anywhere — scope, search, find, wrap, the side-by-side and whitespace toggles, the comments list, copy, refresh, the
   tabs, the pane toggle, the navigator-position key, quit. `move`: down and up, the hunk and file
   steps, the page keys. An empty band is dropped, and a key that would not work in the current state
   never appears. The hunk step shows only where it works, the `Changes` diff and never a preview

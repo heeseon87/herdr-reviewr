@@ -4,6 +4,7 @@
 //! See `specs/diff-view.md`. This module is terminal-free — a `Span` carries an RGB
 //! color, and `src/ui.rs` maps it to a ratatui color.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -257,13 +258,15 @@ impl FileDiff {
     }
 
     /// Build the model from `old` and `new` content, highlighting with `hl`. `previous_path`
-    /// is the rename source, surfaced in the header; `None` for every other change.
+    /// is the rename source, surfaced in the header; `None` for every other change. `ws` decides
+    /// whether whitespace-only differences count as changes (specs/diff-view.md).
     pub fn build(
         path: String,
         previous_path: Option<String>,
         old: &str,
         new: &str,
         hl: &Highlighter,
+        ws: Whitespace,
     ) -> Self {
         let language = language_of(&path);
         let notice = |state| Self {
@@ -286,7 +289,7 @@ impl FileDiff {
         let old_spans = hl.highlight(old, lang);
         let new_spans = hl.highlight(new, lang);
 
-        let mut rows = line_rows(old, new, &old_spans, &new_spans);
+        let mut rows = line_rows(old, new, &old_spans, &new_spans, ws);
         compute_emphasis(&mut rows);
         Self {
             path,
@@ -343,6 +346,44 @@ impl FileDiff {
     }
 }
 
+/// Whether whitespace-only differences count as changes when lines are compared. Rows always
+/// paint the line as written; this decides only what the differ treats as equal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Whitespace {
+    /// Every byte counts. A re-indented line is a change.
+    #[default]
+    Show,
+    /// Whitespace is stripped before comparing, so a re-indent or a reflowed space is not a
+    /// change and a whitespace-only line matches an empty one (`git diff -w`).
+    Ignore,
+}
+
+impl Whitespace {
+    /// The comparison key for one line. `Show` borrows it untouched, so the common path
+    /// allocates nothing per line.
+    fn key(self, line: &str) -> Line<'_> {
+        match self {
+            Whitespace::Show => Line(Cow::Borrowed(line)),
+            // Every whitespace byte goes, not just leading and repeated runs, so `f(a, b)` and
+            // `f(a,b)` compare equal exactly as `git diff -w` has them.
+            Whitespace::Ignore => {
+                Line(Cow::Owned(line.chars().filter(|c| !c.is_whitespace()).collect()))
+            }
+        }
+    }
+}
+
+/// One interned line, as the differ compares it. `AsRef<[u8]>` is what imara-diff's indent
+/// heuristic reads to place a slider, which `Cow<str>` alone does not provide.
+#[derive(PartialEq, Eq, Hash, Debug, Default)]
+struct Line<'a>(Cow<'a, str>);
+
+impl AsRef<[u8]> for Line<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
 /// The line-level diff of `old` against `new` as rows, in display order: each change block's
 /// deletions, then its insertions, with unchanged lines as `Context` between them. Folds and
 /// word emphasis come later; every `emphasis` starts empty.
@@ -353,12 +394,18 @@ impl FileDiff {
 /// trailing a stray `#[test]`. A heuristic, not a guarantee (specs/diff-view.md, "The model").
 /// Lines are interned the same way the highlighter splits them, so a token index is a line
 /// index into `old_spans`/`new_spans`.
-fn line_rows(old: &str, new: &str, old_spans: &[Vec<Span>], new_spans: &[Vec<Span>]) -> Vec<Row> {
+fn line_rows(
+    old: &str,
+    new: &str,
+    old_spans: &[Vec<Span>],
+    new_spans: &[Vec<Span>],
+    ws: Whitespace,
+) -> Vec<Row> {
     let line = |spans: &[Vec<Span>], i: u32| spans.get(i as usize).cloned().unwrap_or_default();
 
     let mut input = InternedInput::default();
-    input.update_before(old.split_inclusive('\n'));
-    input.update_after(new.split_inclusive('\n'));
+    input.update_before(old.split_inclusive('\n').map(|l| ws.key(l)));
+    input.update_after(new.split_inclusive('\n').map(|l| ws.key(l)));
     // A token index addresses a highlighted line by the same count, or every line number past
     // the first mismatch would be plausibly wrong rather than visibly broken (O6, overview.md).
     debug_assert_eq!(input.before.len(), old_spans.len(), "old lines vs highlighted lines");
@@ -624,16 +671,19 @@ impl DiffCache {
         old: &str,
         new: &str,
         hl: &Highlighter,
+        ws: Whitespace,
     ) -> FileDiff {
-        let key = content_hash(previous_path.as_deref(), old, new);
-        self.get_or_build(path.clone(), key, || FileDiff::build(path, previous_path, old, new, hl))
+        let key = content_hash(previous_path.as_deref(), old, new, ws);
+        self.get_or_build(path.clone(), key, || {
+            FileDiff::build(path, previous_path, old, new, hl, ws)
+        })
     }
 
     /// Return the cached File view when `content` is unchanged for `path`, else build it.
     /// File-view entries are namespaced under a `file:` key so a path's File view and Diff
     /// view coexist in the cache instead of evicting each other on a tab switch.
     pub fn get_file(&mut self, path: String, content: &str, hl: &Highlighter) -> FileDiff {
-        let key = content_hash(None, content, content);
+        let key = content_hash(None, content, content, Whitespace::Show);
         self.get_or_build(format!("file:{path}"), key, || FileDiff::build_file(path, content, hl))
     }
 
@@ -660,8 +710,11 @@ impl DiffCache {
     }
 }
 
-fn content_hash(previous_path: Option<&str>, old: &str, new: &str) -> u64 {
+fn content_hash(previous_path: Option<&str>, old: &str, new: &str, ws: Whitespace) -> u64 {
     let mut h = DefaultHasher::new();
+    // The whitespace mode is part of the key, so toggling it rebuilds rather than returning the
+    // other mode's rows under the same content (specs/diff-view.md).
+    (ws == Whitespace::Ignore).hash(&mut h);
     previous_path.hash(&mut h);
     old.hash(&mut h);
     new.hash(&mut h);
@@ -670,7 +723,9 @@ fn content_hash(previous_path: Option<&str>, old: &str, new: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffCache, FileDiff, FileState, Row, Unit, View, language_of, pair_rows};
+    use super::{
+        DiffCache, FileDiff, FileState, Row, Unit, View, Whitespace, language_of, pair_rows,
+    };
     use crate::highlight::Highlighter;
     use crate::theme;
 
@@ -778,7 +833,12 @@ mod tests {
 
     fn build(old: &str, new: &str) -> FileDiff {
         let hl = Highlighter::new(mocha());
-        FileDiff::build("a.rs".into(), None, old, new, &hl)
+        FileDiff::build("a.rs".into(), None, old, new, &hl, Whitespace::Show)
+    }
+
+    fn build_ws_ignored(old: &str, new: &str) -> FileDiff {
+        let hl = Highlighter::new(mocha());
+        FileDiff::build("a.rs".into(), None, old, new, &hl, Whitespace::Ignore)
     }
 
     #[test]
@@ -787,8 +847,9 @@ mod tests {
         let mut cache = DiffCache::new();
         // Same path + same content, but one is a rename (carries a previous_path) and one is
         // not. The cache must not return the rename's build for the plain edit.
-        let renamed = cache.get("f.rs".into(), Some("old.rs".into()), "x\n", "y\n", &hl);
-        let plain = cache.get("f.rs".into(), None, "x\n", "y\n", &hl);
+        let renamed =
+            cache.get("f.rs".into(), Some("old.rs".into()), "x\n", "y\n", &hl, Whitespace::Show);
+        let plain = cache.get("f.rs".into(), None, "x\n", "y\n", &hl, Whitespace::Show);
         assert_eq!(renamed.previous_path.as_deref(), Some("old.rs"));
         assert_eq!(plain.previous_path, None);
     }
@@ -853,6 +914,62 @@ mod tests {
         assert!(
             changed.iter().any(|(_, t)| t == "fn new_case() {"),
             "the new function's signature is an insertion, not context reused from the old one",
+        );
+    }
+
+    #[test]
+    fn ignoring_whitespace_keeps_the_whole_function_boundary() {
+        // Stripping whitespace to compare also strips the indentation the slider heuristic reads,
+        // so the mode could quietly undo the boundary the histogram algorithm buys. It must not:
+        // the same added-function case still opens on its attribute (specs/diff-view.md).
+        let old = "#[test]\nfn old_case() {\n    assert!(a);\n}\n";
+        let new = "#[test]\nfn new_case() {\n    assert!(b);\n}\n\n#[test]\nfn old_case() {\n    assert!(a);\n}\n";
+        let rows = shape(&build_ws_ignored(old, new));
+        let changed: Vec<_> = rows.iter().filter(|(m, _)| *m != ' ').collect();
+        assert!(
+            changed.iter().all(|(m, _)| *m == '+'),
+            "adding a function deletes nothing: {changed:?}"
+        );
+        assert_eq!(changed.first().unwrap().1, "#[test]", "the block still opens on the attribute");
+    }
+
+    #[test]
+    fn ignoring_whitespace_hides_a_reindent_but_keeps_a_real_edit() {
+        let old = "fn f() {\n    let x = 1;\n    g(x);\n}\n";
+        // The body is re-indented from 4 to 8 spaces, and one line genuinely changes.
+        let new = "fn f() {\n        let x = 2;\n        g(x);\n}\n";
+        let shown = shape(&build(old, new));
+        assert_eq!(
+            shown.iter().filter(|(m, _)| *m != ' ').count(),
+            4,
+            "with whitespace shown, both re-indented lines change: {shown:?}",
+        );
+        let hidden = shape(&build_ws_ignored(old, new));
+        let changed: Vec<_> = hidden.iter().filter(|(m, _)| *m != ' ').collect();
+        assert_eq!(changed.len(), 2, "only the real edit survives: {changed:?}");
+        // The row still paints the line as written, at its new indent.
+        assert_eq!(changed[0].1, "    let x = 1;");
+        assert_eq!(changed[1].1, "        let x = 2;");
+    }
+
+    #[test]
+    fn ignoring_whitespace_hides_a_respacing_inside_the_line() {
+        // `-w` removes every whitespace byte, so interior respacing is equal too, not just a
+        // re-indent (specs/diff-view.md).
+        let d = build_ws_ignored("f(a, b);\n", "f(a,b);\n");
+        assert!(d.rows.iter().all(|r| matches!(r, Row::Context { .. })), "{:?}", shape(&d));
+        let shown = build("f(a, b);\n", "f(a,b);\n");
+        assert_eq!(shape(&shown).iter().filter(|(m, _)| *m != ' ').count(), 2, "shown, it changes");
+    }
+
+    #[test]
+    fn ignoring_whitespace_hides_a_whitespace_only_line_change() {
+        // A line of spaces becomes empty: nothing a reviewer needs to see.
+        let d = build_ws_ignored("a\n   \nb\n", "a\n\nb\n");
+        assert!(
+            d.rows.iter().all(|r| matches!(r, Row::Context { .. } | Row::Fold { .. })),
+            "{:?}",
+            shape(&d),
         );
     }
 
@@ -1002,8 +1119,8 @@ mod tests {
     fn cache_reuses_an_unchanged_build() {
         let hl = Highlighter::new(mocha());
         let mut cache = DiffCache::new();
-        let d1 = cache.get("a.rs".into(), None, "x\n", "y\n", &hl);
-        let d2 = cache.get("a.rs".into(), None, "x\n", "y\n", &hl);
+        let d1 = cache.get("a.rs".into(), None, "x\n", "y\n", &hl, Whitespace::Show);
+        let d2 = cache.get("a.rs".into(), None, "x\n", "y\n", &hl, Whitespace::Show);
         assert_eq!(d1, d2);
     }
 }

@@ -1551,6 +1551,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::PrevFile => app.prev_file(),
             K::Wrap => app.toggle_wrap(),
             K::SideBySide => app.toggle_side_by_side(),
+            K::IgnoreWhitespace => app.toggle_whitespace(),
             K::Preview => app.toggle_preview(),
             K::NavigatorPosition => app.cycle_navigator_position(),
             K::NavigatorGrow => app.resize_navigator(4),

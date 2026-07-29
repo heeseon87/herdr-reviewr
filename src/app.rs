@@ -331,6 +331,7 @@ pub enum FooterAction {
     /// Toggle the side-by-side diff columns; the label names the destination layout
     /// (`x columns` unified, `x unified` in two columns).
     SideBySide,
+    IgnoreWhitespace,
     Scope,
     Send,
     List,
@@ -439,6 +440,10 @@ pub struct App {
     /// widening the pane restores the two columns. `side_by_side_active()` is the honest
     /// on-screen predicate.
     pub side_by_side: bool,
+    /// Whether whitespace-only differences count as changes in the `Changes` diff
+    /// (specs/diff-view.md). Global like `wrap` and `side_by_side`, so a reviewer flips it once
+    /// for a reformatting turn instead of per file.
+    pub whitespace: crate::diff::Whitespace,
     /// Whether the markdown preview is open for the active file tab's file. Both file tabs
     /// render it; the flag is per file tab and resets on a file change (specs/diff-view.md).
     /// Only the armed toggle — `preview_active()` is the honest on-screen predicate.
@@ -632,6 +637,7 @@ impl App {
             h_scroll: 0,
             wrap: true,
             side_by_side: false,
+            whitespace: crate::diff::Whitespace::Show,
             preview: false,
             preview_scroll: 0,
             preview_text: String::new(),
@@ -809,6 +815,7 @@ impl App {
                 self.stash = std::mem::take(&mut old.stash);
                 self.wrap = old.wrap;
                 self.side_by_side = old.side_by_side;
+                self.whitespace = old.whitespace;
                 self.preview = old.preview;
                 self.preview_scroll = old.preview_scroll;
                 self.preview_scrolled = old.preview_scrolled;
@@ -1056,7 +1063,8 @@ impl App {
         }
         self.diff_path = Some(path.clone());
         let (old, new) = self.content_sides(&path, previous_path.as_deref());
-        self.diff = self.cache.get(path, previous_path, &old, &new, &self.highlighter);
+        self.diff =
+            self.cache.get(path, previous_path, &old, &new, &self.highlighter, self.whitespace);
         // Hold the new side as the preview's render input, the same current content the File
         // view previews. A non-markdown file, a notice, or a deleted file (empty new side)
         // holds nothing, so its toggle stays inert (specs/diff-view.md).
@@ -1331,6 +1339,77 @@ impl App {
             return i;
         }
         self.diff_units().iter().position(|u| u.left == Some(i) || u.right == Some(i)).unwrap_or(0)
+    }
+
+    /// Toggle whether whitespace-only differences count as changes, and rebuild the open diff
+    /// under the new mode (specs/diff-view.md).
+    ///
+    /// A no-op while composing, for the same reason `set_scope` is: the rows a draft anchors to
+    /// must not move under it. Inert in the `All files` File view, which has no old side to
+    /// compare against.
+    pub fn toggle_whitespace(&mut self) {
+        if !self.whitespace_toggle_available() || self.composing() {
+            return;
+        }
+        self.whitespace = match self.whitespace {
+            crate::diff::Whitespace::Show => crate::diff::Whitespace::Ignore,
+            crate::diff::Whitespace::Ignore => crate::diff::Whitespace::Show,
+        };
+        // Every cached diff was built under the old mode. The mode is part of the cache key, so
+        // this only avoids holding two builds per file, never correctness.
+        self.cache = DiffCache::new();
+        let Some(path) = self.diff_path.clone() else { return };
+        // The cursor keeps the source line it was on, not the row index: the mode changes how
+        // many rows a file has, so an index would drift (O6, specs/overview.md). Folds keep their
+        // line-number anchors; one that no longer matches simply stays collapsed.
+        let anchor = self.visible.get(self.diff_cursor).and_then(row_anchor);
+        // The open build already holds the rename source, so the rebuild diffs the same pair.
+        let previous_path = self.diff.previous_path.clone();
+        self.set_diff(path, previous_path);
+        if let Some(anchor) = anchor
+            && let Some(i) = self.nearest_row_at_line(anchor)
+        {
+            self.diff_cursor = i;
+            self.select_anchor = None; // a selection's rows may not survive the rebuild
+            self.settle_read();
+        }
+        self.reveal_diff = true;
+    }
+
+    /// Whether the `ignore-whitespace` binding does anything here: an open Diff view with rows.
+    /// The File view shows one version, so it has no whitespace difference to hide.
+    #[must_use]
+    pub fn whitespace_toggle_available(&self) -> bool {
+        self.diff.view == crate::diff::View::Diff
+            && self.diff.state == FileState::Normal
+            && !self.visible.is_empty()
+    }
+
+    /// The visible row carrying `anchor`, else the nearest row at or past its line on either
+    /// side, else the last row. Identity first, nearest surviving target second, clamp last
+    /// (O6, specs/overview.md).
+    ///
+    /// The side is part of the identity: a rebuild can turn one changed line into a
+    /// deletion/insertion pair that both number the same line, and a cursor that sat on the new
+    /// side belongs back on the new side.
+    fn nearest_row_at_line(&self, anchor: (Side, u32)) -> Option<usize> {
+        if self.visible.is_empty() {
+            return None;
+        }
+        let (side, line) = anchor;
+        self.visible
+            .iter()
+            .position(|r| row_anchor(r) == Some(anchor))
+            .or_else(|| {
+                self.visible.iter().position(|r| match side {
+                    Side::New => r.new_no().is_some_and(|n| n >= line),
+                    Side::Old => r.old_no().is_some_and(|n| n >= line),
+                })
+            })
+            .or_else(|| {
+                self.visible.iter().position(|r| row_anchor(r).is_some_and(|(_, n)| n >= line))
+            })
+            .or(Some(self.visible.len() - 1))
     }
 
     /// Toggle line wrap; reset the horizontal scroll, which only applies with wrap off.
@@ -2196,8 +2275,14 @@ impl App {
                 continue;
             }
             let (old, new) = self.content_sides(&entry.path, entry.previous_path.as_deref());
-            let diff =
-                self.cache.get(entry.path, entry.previous_path, &old, &new, &self.highlighter);
+            let diff = self.cache.get(
+                entry.path,
+                entry.previous_path,
+                &old,
+                &new,
+                &self.highlighter,
+                self.whitespace,
+            );
             if hunk_row(&diff.rows, None, forward).is_some() {
                 return Some(row);
             }
@@ -2932,6 +3017,7 @@ impl App {
             &old,
             &new,
             &self.highlighter,
+            self.whitespace,
         );
         let is_change = |r: &Row| matches!(r, Row::Deletion { .. } | Row::Insertion { .. });
         let rows = &diff.rows;
@@ -3752,6 +3838,11 @@ impl App {
         if self.side_by_side_available() {
             out.push((A::SideBySide, Go));
         }
+        // The whitespace toggle shows wherever a diff is open, for the same reason: never a dead
+        // key. It reaches the Diff view only, so the File view does not list it.
+        if self.whitespace_toggle_available() {
+            out.push((A::IgnoreWhitespace, Go));
+        }
         if !self.store.is_empty() {
             out.push((A::List, Go));
             out.push((A::Copy, Go));
@@ -3845,6 +3936,12 @@ impl App {
             self.list_cursor = self.store.len().saturating_sub(1);
         }
     }
+}
+
+/// A row's place identity: which side of the diff it belongs to and its line number there. A
+/// context row counts as new-side, the number the reviewer reads it by. A fold has none.
+fn row_anchor(row: &Row) -> Option<(Side, u32)> {
+    row.new_no().map(|n| (Side::New, n)).or_else(|| row.old_no().map(|n| (Side::Old, n)))
 }
 
 /// Step `cur` by `delta` within `0..n`, clamping at both ends.
