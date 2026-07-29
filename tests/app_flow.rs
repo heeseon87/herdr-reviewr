@@ -406,11 +406,12 @@ fn file_skips_jump_file_to_file_from_either_pane() {
     app.next_file();
     assert_eq!(app.diff_path.as_deref(), Some("src/b.rs"));
 
-    // And it works from the diff pane, where it opens the file without moving the focus.
+    // And it works from the diff pane; locally, a file step also pulls focus to the file list so
+    // the reviewed-hunks Enter/Backspace act per file right after `f`/`F`.
     app.focus = Focus::Diff;
     app.next_file();
     assert_eq!(app.diff_path.as_deref(), Some("src/c.rs"));
-    assert_eq!(app.focus, Focus::Diff);
+    assert_eq!(app.focus, Focus::Files);
     assert_eq!(selected_path(&app), Some("src/c.rs"), "the list selection follows the skip");
 }
 

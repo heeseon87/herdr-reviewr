@@ -6,7 +6,8 @@
 //! terminal and maps input events onto these methods.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -404,6 +405,17 @@ pub struct App {
     pub visible: Vec<Row>,
     /// Fold anchors (first-hidden-line numbers) currently expanded; survives a poll.
     expanded_folds: HashSet<u32>,
+    /// Content-hashed keys of hunks marked "reviewed" (a deterministic FNV of the file path plus
+    /// the hunk's changed-line text). Content-keyed on purpose: it survives restarts and poll
+    /// rebuilds, and a hunk that gets edited re-derives to a new key — so it reverts to unreviewed,
+    /// which is correct (changed code must be re-read). Persisted per worktree under ~/.cache.
+    reviewed: HashSet<u64>,
+    /// Per-visible-row flag: is this row part of a reviewed hunk? Rebuilt alongside `visible`.
+    reviewed_visible: Vec<bool>,
+    /// Cache of "every hunk in this file is reviewed", keyed by path — the file list reads it for
+    /// the ✓ marker. Updated when a file's diff is loaded or toggled (`recompute_reviewed_flags`),
+    /// so only files opened this session are present; an unopened file simply shows no mark.
+    file_all_reviewed: HashMap<String, bool>,
     /// The file the open diff belongs to — the diff title, frozen with the diff
     /// while composing even if `file_cursor` drifts as the file list updates.
     pub diff_path: Option<String>,
@@ -547,6 +559,18 @@ enum PluginConfigState {
     Blocked { error: String },
 }
 
+/// Fold `s`'s bytes into `h` with FNV-1a (the same deterministic hash `worktree_key` uses), then
+/// a separator byte. Deterministic across processes — required so persisted reviewed-hunk keys
+/// still match after a restart (unlike the std hasher's per-process random seed).
+fn fnv1a_str(h: &mut u64, s: &str) {
+    for b in s.bytes() {
+        *h ^= u64::from(b);
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    *h ^= u64::from(b'\0');
+    *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+}
+
 impl App {
     pub fn new(repo: PathBuf, scope: Scope, base: Option<String>) -> Self {
         Self::build(repo, scope, base, true)
@@ -563,6 +587,9 @@ impl App {
         // mirror follows its completions (specs/herdr-host.md).
         let turn_baseline = if load_turn { crate::world::seed_baseline(&repo) } else { None };
         let theme = theme::resolve(None);
+        // Load persisted reviewed-hunk keys for this worktree (only for a real sidebar, not the
+        // error-only `blocked` one). A missing/unreadable file is simply an empty set.
+        let reviewed = if load_turn { Self::load_reviewed_set(&repo) } else { HashSet::new() };
         Self {
             repo,
             base,
@@ -584,6 +611,9 @@ impl App {
             diff: FileDiff::empty(),
             visible: Vec::new(),
             expanded_folds: HashSet::new(),
+            reviewed,
+            reviewed_visible: Vec::new(),
+            file_all_reviewed: HashMap::new(),
             diff_path: None,
             diff_cursor: 0,
             diff_scroll: 0,
@@ -966,6 +996,10 @@ impl App {
         if self.mode == Mode::Find && (open != self.diff_path || !self.find_available()) {
             self.close_find();
         }
+        // Fill file-list ✓ markers for every changed file (cache-miss gated). After a restart the
+        // reviewed set is loaded but the per-file cache is cold, so markers would otherwise only
+        // appear once each file is opened; this makes them show immediately.
+        self.refresh_reviewed_markers();
         self.tab_visited = true;
     }
 
@@ -1100,6 +1134,7 @@ impl App {
                 _ => vec![row.clone()],
             })
             .collect();
+        self.recompute_reviewed_flags();
     }
 
     /// Expand the fold under the cursor, revealing its hidden lines. Expansion is
@@ -1985,12 +2020,13 @@ impl App {
         self.step_file(false);
     }
 
-    /// Move the file cursor to the nearest file row and open it, keeping the focused pane. The
-    /// cursor carries the selection with it, so the list always highlights the open file.
+    /// Move the file cursor to the nearest file row and open it. The cursor carries the selection
+    /// with it, so the list always highlights the open file.
     ///
-    /// The list steps from its own cursor, which is what the reviewer is moving there. The diff
-    /// steps from the open file, so a press always opens a file — the cursor may sit elsewhere,
-    /// parked on a directory row (which keeps the open diff).
+    /// The step starts from the file list's own cursor when it is focused, otherwise from the open
+    /// file (the cursor may sit elsewhere, parked on a directory row). Local: `f`/`F` then pull
+    /// focus to the file list, so the reviewed-hunks Enter/Backspace act per file (whole-file
+    /// mark) right after a file step.
     fn step_file(&mut self, forward: bool) {
         if !self.can_traverse() {
             return;
@@ -2000,6 +2036,7 @@ impl App {
         self.file_cursor = row;
         self.open_cursor_file();
         self.reveal_files = true;
+        self.focus = Focus::Files;
     }
 
     /// `next-hunk`: jump to the nearest hunk below the cursor (`specs/input.md`).
@@ -2022,6 +2059,9 @@ impl App {
         if !self.can_traverse() || self.tab != Tab::Changes || self.preview_active() {
             return;
         }
+        // Local: hunk stepping is a diff-reading move, so pull focus to the diff. This makes the
+        // reviewed-hunks Enter/Backspace act per hunk (`mark_and_next`) right after `]`/`[`.
+        self.focus = Focus::Diff;
         if let Some(row) = hunk_row(&self.visible, Some(self.diff_cursor), forward) {
             self.diff_cursor = row;
             self.reveal_diff = true;
@@ -2714,6 +2754,386 @@ impl App {
     }
 
     /// Move the diff cursor to the next (`dir >= 0`) or previous commented line.
+    /// The visible-row index that starts each changed hunk: a Deletion/Insertion row whose
+    /// predecessor is not one (a Context/Fold boundary, or the top). A collapsed `Fold` is
+    /// context, so it reads as a boundary — jumping lands on the next visible change.
+    fn hunk_starts(&self) -> Vec<usize> {
+        let is_change = |r: &Row| matches!(r, Row::Deletion { .. } | Row::Insertion { .. });
+        self.visible
+            .iter()
+            .enumerate()
+            .filter(|&(i, row)| is_change(row) && (i == 0 || !is_change(&self.visible[i - 1])))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The cursor's hunk start index, if the cursor sits on a changed line (walk up while the
+    /// previous row is also a change). `None` on a context/fold row.
+    fn hunk_start_at_cursor(&self) -> Option<usize> {
+        let is_change = |r: &Row| matches!(r, Row::Deletion { .. } | Row::Insertion { .. });
+        if !self.visible.get(self.diff_cursor).is_some_and(is_change) {
+            return None;
+        }
+        let mut i = self.diff_cursor;
+        while i > 0 && is_change(&self.visible[i - 1]) {
+            i -= 1;
+        }
+        Some(i)
+    }
+
+    /// A hunk's content key: a deterministic FNV-1a of the file path plus each changed line's
+    /// text (line numbers excluded, so edits above don't shift it). Same bytes ⇒ same key across
+    /// restarts. `None` if `start` isn't a changed row. Two identical hunks in one file collide
+    /// (checking one checks both) — accepted for v1.
+    fn hunk_key(&self, start: usize) -> Option<u64> {
+        let path = self.diff_path.as_deref()?;
+        let is_change = |r: &Row| matches!(r, Row::Deletion { .. } | Row::Insertion { .. });
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        fnv1a_str(&mut h, path);
+        let mut any = false;
+        let mut i = start;
+        while i < self.visible.len() && is_change(&self.visible[i]) {
+            fnv1a_str(&mut h, "\n");
+            fnv1a_str(&mut h, &self.visible[i].text());
+            any = true;
+            i += 1;
+        }
+        any.then_some(h)
+    }
+
+    /// Whether visible row `i` belongs to a reviewed hunk (drives the gutter marker).
+    pub fn reviewed_line(&self, i: usize) -> bool {
+        self.reviewed_visible.get(i).copied().unwrap_or(false)
+    }
+
+    /// Rebuild the per-row reviewed flags from `reviewed` + the current `visible`.
+    fn recompute_reviewed_flags(&mut self) {
+        let is_change = |r: &Row| matches!(r, Row::Deletion { .. } | Row::Insertion { .. });
+        let mut flags = vec![false; self.visible.len()];
+        for start in self.hunk_starts() {
+            if self.hunk_key(start).is_some_and(|k| self.reviewed.contains(&k)) {
+                let mut i = start;
+                while i < self.visible.len() && is_change(&self.visible[i]) {
+                    flags[i] = true;
+                    i += 1;
+                }
+            }
+        }
+        self.reviewed_visible = flags;
+        // Cache whether the whole open file is reviewed, for the file list's ✓ marker. A hunkless
+        // file (e.g. a pure rename) is never "all reviewed".
+        if let Some(path) = self.diff_path.clone() {
+            let starts = self.hunk_starts();
+            let done = !starts.is_empty()
+                && starts
+                    .iter()
+                    .all(|&s| self.hunk_key(s).is_some_and(|k| self.reviewed.contains(&k)));
+            self.file_all_reviewed.insert(path, done);
+        }
+    }
+
+    /// Whether the file at `path` has every hunk reviewed (cached). Drives the file list's ✓
+    /// marker. Populated for opened files (`recompute_reviewed_flags`) and, on reload, for every
+    /// changed file (`refresh_reviewed_markers`) — so markers appear right after a restart.
+    pub fn file_reviewed(&self, path: &str) -> bool {
+        self.file_all_reviewed.get(path).copied().unwrap_or(false)
+    }
+
+    /// Whether every hunk of `path`'s diff is reviewed, computed off-screen: it builds the diff in
+    /// a local, never touching `self.diff`/`visible`/`diff_path` (which belong to the open view).
+    /// Mirrors `hunk_key`'s hashing over the freshly built rows.
+    fn compute_file_all_reviewed(&mut self, path: &str, previous_path: Option<&str>) -> bool {
+        let (old, new) = self.content_sides(path, previous_path);
+        let diff = self.cache.get(
+            path.to_string(),
+            previous_path.map(String::from),
+            &old,
+            &new,
+            &self.highlighter,
+        );
+        let is_change = |r: &Row| matches!(r, Row::Deletion { .. } | Row::Insertion { .. });
+        let rows = &diff.rows;
+        let starts: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|&(i, r)| is_change(r) && (i == 0 || !is_change(&rows[i - 1])))
+            .map(|(i, _)| i)
+            .collect();
+        if starts.is_empty() {
+            return false; // a hunkless file (e.g. pure rename) is never "all reviewed"
+        }
+        starts.iter().all(|&s| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            fnv1a_str(&mut h, path);
+            let mut i = s;
+            while i < rows.len() && is_change(&rows[i]) {
+                fnv1a_str(&mut h, "\n");
+                fnv1a_str(&mut h, &rows[i].text());
+                i += 1;
+            }
+            self.reviewed.contains(&h)
+        })
+    }
+
+    /// Fill file-list ✓ markers for changed files not yet cached. The cache-miss gate keeps a poll
+    /// from recomputing every file each tick: only first-seen files (e.g. all of them right after
+    /// a restart) are computed; already-cached ones are skipped.
+    fn refresh_reviewed_markers(&mut self) {
+        let todo: Vec<(String, Option<String>)> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                self.changed.contains_key(&e.path) && !self.file_all_reviewed.contains_key(&e.path)
+            })
+            .map(|e| (e.path.clone(), e.previous_path.clone()))
+            .collect();
+        for (path, prev) in todo {
+            let done = self.compute_file_all_reviewed(&path, prev.as_deref());
+            self.file_all_reviewed.insert(path, done);
+        }
+    }
+
+    /// Enter/Backspace in the file list: mark (`reviewed=true`) or unmark (`false`) every hunk in
+    /// the file under the cursor. Unconditional — mirrors the diff's Enter/Backspace, not a toggle.
+    /// Opens the file's diff first so its hunks are known. No-op on a directory row or hunkless file.
+    pub fn set_file_reviewed(&mut self, reviewed: bool) {
+        if self.file_rows.get(self.file_cursor).and_then(file_list::Row::file_index).is_none() {
+            return;
+        }
+        self.open_cursor_file();
+        let keys: Vec<u64> = self.hunk_starts().iter().filter_map(|&s| self.hunk_key(s)).collect();
+        if keys.is_empty() {
+            return;
+        }
+        for k in keys {
+            if reviewed {
+                self.reviewed.insert(k);
+            } else {
+                self.reviewed.remove(&k);
+            }
+        }
+        self.recompute_reviewed_flags();
+        self.save_reviewed();
+    }
+
+    /// Enter: unconditionally mark the current hunk reviewed (never a toggle — an already-reviewed
+    /// hunk stays reviewed), then advance to the next unreviewed hunk. The mirror of Backspace's
+    /// unmark-and-prev. A no-op mark off a hunk (still advances).
+    pub fn mark_and_next(&mut self) {
+        if let Some(start) = self.hunk_start_at_cursor()
+            && let Some(key) = self.hunk_key(start)
+        {
+            self.reviewed.insert(key);
+            self.recompute_reviewed_flags();
+            self.save_reviewed();
+        }
+        self.jump_unreviewed(1);
+    }
+
+    /// Mirror of Space's mark-and-next (Shift+Space): unconditionally clear the current hunk's
+    /// reviewed mark (always un-marks, never a toggle), then step to the previous hunk (spilling
+    /// across files like `jump_hunk`).
+    pub fn unmark_and_prev(&mut self) {
+        if let Some(start) = self.hunk_start_at_cursor()
+            && let Some(key) = self.hunk_key(start)
+            && self.reviewed.remove(&key)
+        {
+            self.recompute_reviewed_flags();
+            self.save_reviewed();
+        }
+        self.jump_hunk(-1);
+    }
+
+    /// Local: toggle the reviewed mark of the hunk under the cursor without moving (Space). Unlike
+    /// Enter/Backspace it neither advances nor retreats, so the reviewer can flip a single hunk in
+    /// place. `None` when the cursor isn't on a changed row.
+    pub fn toggle_hunk_reviewed(&mut self) {
+        if let Some(start) = self.hunk_start_at_cursor()
+            && let Some(key) = self.hunk_key(start)
+        {
+            if !self.reviewed.remove(&key) {
+                self.reviewed.insert(key);
+            }
+            self.recompute_reviewed_flags();
+            self.save_reviewed();
+        }
+    }
+
+    /// Local: toggle the whole current file's reviewed mark in place (Space, file list focused).
+    /// If every hunk is already reviewed it clears them, otherwise it marks them all — the same
+    /// all-or-nothing rule the ✓ marker reads.
+    pub fn toggle_file_reviewed(&mut self) {
+        if self.file_rows.get(self.file_cursor).and_then(file_list::Row::file_index).is_none() {
+            return;
+        }
+        self.open_cursor_file();
+        let keys: Vec<u64> = self.hunk_starts().iter().filter_map(|&s| self.hunk_key(s)).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let all_reviewed = keys.iter().all(|k| self.reviewed.contains(k));
+        self.set_file_reviewed(!all_reviewed);
+    }
+
+    /// The next (`dir >= 0`) / previous unreviewed hunk start relative to `after` (or the very
+    /// first/last when `after` is `None`), within the current file's visible rows.
+    fn unreviewed_hunk(&self, after: Option<usize>, dir: isize) -> Option<usize> {
+        let mut starts: Vec<usize> = self
+            .hunk_starts()
+            .into_iter()
+            .filter(|&s| self.hunk_key(s).is_some_and(|k| !self.reviewed.contains(&k)))
+            .collect();
+        if dir < 0 {
+            starts.reverse();
+        }
+        match after {
+            Some(cur) => starts.into_iter().find(|&i| if dir >= 0 { i > cur } else { i < cur }),
+            None => starts.into_iter().next(),
+        }
+    }
+
+    /// Jump to the next/previous UNREVIEWED hunk, spilling across files like `jump_hunk`. Stops
+    /// silently when none remain, restoring the starting file if the search moved past it.
+    pub fn jump_unreviewed(&mut self, dir: isize) {
+        self.focus = Focus::Diff;
+        if let Some(t) = self.unreviewed_hunk(Some(self.diff_cursor), dir) {
+            self.select_anchor = None;
+            self.diff_cursor = t;
+            self.reveal_diff = true;
+            return;
+        }
+        let (saved_file, saved_diff) = (self.file_cursor, self.diff_cursor);
+        while self.step_changed_file(dir) {
+            if let Some(t) = self.unreviewed_hunk(None, dir) {
+                self.focus = Focus::Diff;
+                self.select_anchor = None;
+                self.diff_cursor = t;
+                self.reveal_diff = true;
+                return;
+            }
+        }
+        // Nothing unreviewed anywhere ahead → return to where we started.
+        if self.file_cursor != saved_file {
+            self.file_cursor = saved_file;
+            self.open_cursor_file();
+            self.diff_cursor = saved_diff.min(self.visible.len().saturating_sub(1));
+        }
+    }
+
+    /// The persisted reviewed-keys file for a worktree: ~/.cache/herdr-reviewr/reviewed-<key>.txt.
+    fn reviewed_file(repo: &Path) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(
+            PathBuf::from(home)
+                .join(".cache/herdr-reviewr")
+                .join(format!("reviewed-{}.txt", git::worktree_key(repo))),
+        )
+    }
+
+    /// Load the reviewed-key set (one hex u64 per line). Missing/unreadable ⇒ empty set.
+    fn load_reviewed_set(repo: &Path) -> HashSet<u64> {
+        let Some(p) = Self::reviewed_file(repo) else { return HashSet::new() };
+        let Ok(text) = std::fs::read_to_string(&p) else { return HashSet::new() };
+        text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()
+    }
+
+    /// Persist the reviewed-key set. Errors are swallowed — a read-only cache must never take
+    /// down the TUI (the marks just won't survive the session).
+    fn save_reviewed(&self) {
+        let Some(p) = Self::reviewed_file(&self.repo) else { return };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut body = String::new();
+        for k in &self.reviewed {
+            let _ = writeln!(body, "{k:016x}");
+        }
+        let _ = std::fs::write(&p, body);
+    }
+
+    /// Indices of the changed-FILE rows in the file list (File rows, skipping Dir rows).
+    fn changed_file_rows(&self) -> Vec<usize> {
+        self.file_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.file_index().is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move the file cursor to the adjacent changed file (NO wrap) and load its diff, leaving
+    /// focus untouched. Returns whether it actually moved (false at the first/last file). The
+    /// shared core of `jump_file` (which adds wrap) and `jump_hunk`'s cross-file spill-over.
+    fn step_changed_file(&mut self, dir: isize) -> bool {
+        let idxs = self.changed_file_rows();
+        let cur = self.file_cursor;
+        let target = if dir >= 0 {
+            idxs.iter().copied().find(|&i| i > cur)
+        } else {
+            idxs.iter().rev().copied().find(|&i| i < cur)
+        };
+        match target {
+            Some(t) => {
+                self.file_cursor = t;
+                self.open_cursor_file();
+                self.reveal_files = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move the diff cursor to the next (`dir >= 0`) or previous changed hunk. When the current
+    /// file has no further hunk that way, spill over into the adjacent changed file and land on
+    /// its first (or last) hunk — so hunk stepping flows across the whole change set. No wrap: at
+    /// the last hunk of the last file it simply stops. Navigation, so it clears any selection.
+    pub fn jump_hunk(&mut self, dir: isize) {
+        self.focus = Focus::Diff;
+        let cur = self.diff_cursor;
+        let within = {
+            let idxs = self.hunk_starts();
+            if dir >= 0 {
+                idxs.iter().copied().find(|&i| i > cur)
+            } else {
+                idxs.iter().rev().copied().find(|&i| i < cur)
+            }
+        };
+        if let Some(t) = within {
+            self.select_anchor = None;
+            self.diff_cursor = t;
+            self.reveal_diff = true;
+            return;
+        }
+        // No more hunks here → cross into the adjacent changed file's first/last hunk (its diff
+        // is loaded synchronously by step_file → set_diff → rebuild_visible, so hunk_starts is
+        // valid immediately). Land on the file top if that file somehow has no hunk rows.
+        if self.step_changed_file(dir) {
+            self.focus = Focus::Diff; // stay on the diff, though step_file moved the file cursor
+            let h = self.hunk_starts();
+            let landing = if dir >= 0 { h.first().copied() } else { h.last().copied() };
+            self.select_anchor = None;
+            self.diff_cursor = landing.unwrap_or(0);
+            self.reveal_diff = true;
+        }
+    }
+
+    /// Move the file-list cursor to the next (`dir >= 0`) or previous changed FILE, skipping the
+    /// directory rows that plain up/down stops on. Wraps at the ends. Selects the landed file
+    /// (loads its diff) via `open_cursor_file`. `step_file` is the no-wrap core.
+    pub fn jump_file(&mut self, dir: isize) {
+        if !self.step_changed_file(dir) {
+            // At the first/last file: wrap to the far end.
+            let idxs = self.changed_file_rows();
+            let t = if dir >= 0 { idxs.first().copied() } else { idxs.last().copied() };
+            if let Some(t) = t {
+                self.file_cursor = t;
+                self.open_cursor_file();
+                self.reveal_files = true;
+            }
+        }
+        self.focus = Focus::Files;
+    }
+
     pub fn jump_comment(&mut self, dir: isize) {
         if self.preview_active() {
             return; // no cursor and no cards in the preview (specs/diff-view.md)

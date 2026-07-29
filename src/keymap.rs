@@ -25,6 +25,8 @@ pub enum Action {
     NavigatorGrow,
     NavigatorShrink,
     ExpandAllFolds,
+    NextUnreviewed,
+    PrevUnreviewed,
     Select,
     Comment,
     Edit,
@@ -84,7 +86,7 @@ impl std::fmt::Display for Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 33] = [
+const ACTIONS: [(Action, &str, &[Key]); 35] = [
     (Action::Down, "down", &[Key::plain('j')]),
     (Action::Up, "up", &[Key::plain('k')]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -102,8 +104,10 @@ const ACTIONS: [(Action, &str, &[Key]); 33] = [
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
     (Action::NavigatorGrow, "navigator-grow", &[Key::plain('<')]),
     (Action::NavigatorShrink, "navigator-shrink", &[Key::plain('>')]),
-    // A local addition, on a key upstream leaves free.
+    // Local additions: expand-all-folds and unreviewed-hunk navigation (keys upstream leaves free).
     (Action::ExpandAllFolds, "expand-all-folds", &[Key::plain('a')]),
+    (Action::NextUnreviewed, "next-unreviewed", &[Key::plain(')')]),
+    (Action::PrevUnreviewed, "prev-unreviewed", &[Key::plain('(')]),
     (Action::Select, "select", &[Key::plain('v')]),
     (Action::Comment, "comment", &[Key::plain('c')]),
     (Action::Edit, "edit", &[Key::plain('e')]),

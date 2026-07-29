@@ -603,18 +603,23 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                     ];
                     selectable_row(spans, width, fill)
                 }
-                RowKind::File { annotation, .. } => file_row_item(
-                    &FileRowSpec {
-                        indent: &indent,
-                        annotation: annotation.as_ref(),
-                        name: &row.name,
-                        ignored: row.ignored,
-                        emphasis: &[],
-                    },
-                    width,
-                    fill,
-                    p,
-                ),
+                RowKind::File { annotation, index } => {
+                    let reviewed =
+                        app.entries.get(*index).is_some_and(|e| app.file_reviewed(&e.path));
+                    file_row_item(
+                        &FileRowSpec {
+                            indent: &indent,
+                            annotation: annotation.as_ref(),
+                            name: &row.name,
+                            ignored: row.ignored,
+                            emphasis: &[],
+                            reviewed,
+                        },
+                        width,
+                        fill,
+                        p,
+                    )
+                }
             }
         })
         .collect();
@@ -631,6 +636,8 @@ struct FileRowSpec<'a> {
     name: &'a str,
     ignored: bool,
     emphasis: &'a [(u32, u32)],
+    /// Every hunk in this file is reviewed — draws the leading "✓ " marker.
+    reviewed: bool,
 }
 
 /// A file row: `<indent><marker> <name> <stats>` — the marker colored by kind, the basename
@@ -643,15 +650,21 @@ fn file_row_item(
     fill: Option<Color>,
     p: &Palette,
 ) -> ListItem<'static> {
-    let FileRowSpec { indent, annotation, name, ignored, emphasis } = *row;
+    let FileRowSpec { indent, annotation, name, ignored, emphasis, reviewed } = *row;
+    // A fixed 2-col slot before the change marker: "✓ " when every hunk is reviewed, else blank,
+    // so file names stay aligned whether or not the file is done.
+    let review_mark = if reviewed { "✓ " } else { "  " };
     let marker = annotation.map_or(String::new(), |a| format!("{} ", a.change.marker()));
     let (additions, deletions) = annotation.map_or((0, 0), |a| (a.additions, a.deletions));
     let stats = stats_str(additions, deletions);
     let gap = if stats.is_empty() { 0 } else { 2 };
-    let fixed = indent.width() + marker.width() + stats.width() + gap;
+    let fixed = indent.width() + review_mark.width() + marker.width() + stats.width() + gap;
     let shown = elide_head(name, width.saturating_sub(fixed).max(1));
 
-    let mut spans = vec![Span::styled(indent.to_string(), text_style(p))];
+    let mut spans = vec![
+        Span::styled(indent.to_string(), text_style(p)),
+        Span::styled(review_mark.to_string(), Style::default().fg(p.green)),
+    ];
     if let Some(a) = annotation {
         spans.push(Span::styled(marker, Style::default().fg(kind_color(p, a.change.marker()))));
     }
@@ -918,6 +931,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
             commented: commented.contains(&i),
             cursor: i == app.diff_cursor,
             selected: selecting && i >= lo && i <= hi,
+            reviewed: app.reviewed_line(i),
         };
         let mut lines = render_row(&app.visible[i], layout, state);
         for &ci in &cards[i] {
@@ -1028,10 +1042,13 @@ struct RowLayout<'a> {
 
 /// A row's per-row highlight state.
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // independent render flags, not a state enum
 struct RowState {
     commented: bool,
     cursor: bool,
     selected: bool,
+    /// Part of a hunk the user marked reviewed — shows a check in the change-bar column.
+    reviewed: bool,
 }
 
 /// A diff row as one or more full-width display lines: a left change bar, the line
@@ -1040,7 +1057,7 @@ struct RowState {
 /// stay aligned. With wrap off, the line is one row scrolled by `h_scroll`.
 fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'static>> {
     let RowLayout { gutter_w, width, h_scroll, wrap, focused, pal, find } = layout;
-    let RowState { commented, cursor, selected } = state;
+    let RowState { commented, cursor, selected, reviewed } = state;
     if let Row::Fold { .. } = row {
         let label = if cursor {
             format!("  ⋯  {} unmodified lines — → expand", row.hidden())
@@ -1058,10 +1075,16 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
     // A commented line's number takes the peach comment accent; others sit a step brighter
     // than the dim chrome so they stay legible while read.
     let num_color = if commented { pal.peach } else { pal.overlay1 };
-    let (bar, bar_color) = match row.marker() {
-        '-' => ("▌", pal.red),
-        '+' => ("▌", pal.green),
-        _ => (" ", pal.overlay0),
+    // A reviewed hunk's rows show a check in the change-bar column; the red/green row tint below
+    // still conveys +/-. Otherwise the usual change bar.
+    let (bar, bar_color) = if reviewed {
+        ("✓", pal.green)
+    } else {
+        match row.marker() {
+            '-' => ("▌", pal.red),
+            '+' => ("▌", pal.green),
+            _ => (" ", pal.overlay0),
+        }
     };
     let row_bg = if cursor {
         Some(pal.cursor_bg(focused))
@@ -1966,6 +1989,7 @@ fn render_search_results(
                         name: path,
                         ignored: false,
                         emphasis: &[],
+                        reviewed: false,
                     },
                     width,
                     None,
@@ -1985,6 +2009,7 @@ fn render_search_results(
                         name: &hit.path,
                         ignored: false,
                         emphasis: &hit.spans,
+                        reviewed: false,
                     },
                     width,
                     fill,

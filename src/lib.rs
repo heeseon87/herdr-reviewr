@@ -1436,6 +1436,36 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     // folded in here so every context pairs them exactly once. The other fixed keys (`tab`, `esc`,
     // the page keys, `←`/`→`) stay hardcoded per context below (`specs/input.md`).
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Local reviewed-hunks marking, neither key expressible in the char keymap. Enter marks the
+    // current hunk reviewed and advances (in the file list, the whole file's hunks); Backspace
+    // unmarks and steps back. Composing already returned above, where Enter submits and Backspace
+    // edits text.
+    if matches!(key.code, Enter) {
+        if app.focus == Focus::Files {
+            app.set_file_reviewed(true);
+        } else {
+            app.mark_and_next();
+        }
+        return Ok(());
+    }
+    if matches!(key.code, KeyCode::Backspace) {
+        if app.focus == Focus::Files {
+            app.set_file_reviewed(false);
+        } else {
+            app.unmark_and_prev();
+        }
+        return Ok(());
+    }
+    // Space toggles the reviewed mark in place, without moving the cursor: the whole file when the
+    // list is focused, the hunk under the cursor otherwise (local reviewed-hunks feature).
+    if matches!(key.code, Char(' ')) {
+        if app.focus == Focus::Files {
+            app.toggle_file_reviewed();
+        } else {
+            app.toggle_hunk_reviewed();
+        }
+        return Ok(());
+    }
     let action = match key.code {
         Char(c) => keymap.action_for(crate::keymap::Key { ctrl, alt, ch: c }),
         Down => Some(K::Down),
@@ -1518,6 +1548,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::NavigatorGrow => app.resize_navigator(4),
             K::NavigatorShrink => app.resize_navigator(-4),
             K::ExpandAllFolds => app.expand_all_folds(),
+            K::NextUnreviewed => app.jump_unreviewed(1),
+            K::PrevUnreviewed => app.jump_unreviewed(-1),
             K::ScopeUncommitted => app.set_scope(Scope::Uncommitted)?,
             K::ScopeBranch => app.set_scope(Scope::Branch)?,
             K::ScopeLastTurn => app.set_scope(Scope::LastTurn)?,
