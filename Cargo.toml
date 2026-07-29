@@ -15,10 +15,16 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 dirs = "5"
 fff-search = "0.10.0"
+# Line-level diff: the histogram algorithm plus line postprocessing, which lands hunk
+# boundaries on whole functions instead of the shortest edit script (specs/diff-view.md).
+# No unified_diff feature: we build rows, never diff text.
+imara-diff = { version = "0.2", default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Word-level diff only, for the inline emphasis on a paired change line. imara-diff has no
+# unicode word tokenizer, so the two split the work by granularity (src/diff.rs).
 similar = { version = "3.1.1", features = ["text"] }
 # Dumps + fancy-regex only: no yaml-load (we read prebuilt binary syntax dumps, so the
 # unmaintained yaml-rust never enters the tree), no onig (pure-Rust regex engine).

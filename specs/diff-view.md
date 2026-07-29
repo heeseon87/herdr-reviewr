@@ -60,6 +60,8 @@ Content rows are selectable for comments. A `fold` is not.
 
 - Old content comes from `git show`, new content from the worktree (or `git show`, in the `branch` scope). An `untracked` file has empty old content. A `deleted` file has empty new content.
 - Changes group into hunks with a context margin of 3 unchanged lines.
+- A hunk prefers the boundary a reader expects over the shortest edit script. An added or removed function tends to start at its attribute or doc comment and end at its closing brace, so two neighbouring functions read as separate units. This is a preference, not a guarantee: a single-line replacement beside a longer removal can still be absorbed into it and lose its pairing.
+- A hunk's rows come in one order: every deletion, then every insertion. Word emphasis reads that order.
 - The whole file is highlighted, not each hunk. A multi-line string or comment colors correctly inside a hunk.
 - The language is detected from the path. An unknown path renders plain.
 - The diff and highlighting are cached by content. A poll that finds the file unchanged recomputes nothing.

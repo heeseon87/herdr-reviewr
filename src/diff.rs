@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
+use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
 use similar::{ChangeTag, TextDiff};
 
 use crate::highlight::Highlighter;
@@ -284,37 +285,8 @@ impl FileDiff {
         let lang = language.as_deref();
         let old_spans = hl.highlight(old, lang);
         let new_spans = hl.highlight(new, lang);
-        let line = |spans: &[Vec<Span>], i: usize| spans.get(i).cloned().unwrap_or_default();
 
-        let mut rows = Vec::new();
-        for change in TextDiff::from_lines(old, new).iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Equal => {
-                    let (oi, ni) = (change.old_index().unwrap(), change.new_index().unwrap());
-                    rows.push(Row::Context {
-                        old_no: oi as u32 + 1,
-                        new_no: ni as u32 + 1,
-                        spans: line(&new_spans, ni),
-                    });
-                }
-                ChangeTag::Delete => {
-                    let oi = change.old_index().unwrap();
-                    rows.push(Row::Deletion {
-                        old_no: oi as u32 + 1,
-                        spans: line(&old_spans, oi),
-                        emphasis: Vec::new(),
-                    });
-                }
-                ChangeTag::Insert => {
-                    let ni = change.new_index().unwrap();
-                    rows.push(Row::Insertion {
-                        new_no: ni as u32 + 1,
-                        spans: line(&new_spans, ni),
-                        emphasis: Vec::new(),
-                    });
-                }
-            }
-        }
+        let mut rows = line_rows(old, new, &old_spans, &new_spans);
         compute_emphasis(&mut rows);
         Self {
             path,
@@ -369,6 +341,69 @@ impl FileDiff {
             rows: Vec::new(),
         }
     }
+}
+
+/// The line-level diff of `old` against `new` as rows, in display order: each change block's
+/// deletions, then its insertions, with unchanged lines as `Context` between them. Folds and
+/// word emphasis come later; every `emphasis` starts empty.
+///
+/// The engine is imara-diff's histogram algorithm plus its line postprocessing, which slides a
+/// change block toward the boundary a reader expects: an added function tends to start at its
+/// attribute or doc comment and end at its closing brace, rather than opening mid-body and
+/// trailing a stray `#[test]`. A heuristic, not a guarantee (specs/diff-view.md, "The model").
+/// Lines are interned the same way the highlighter splits them, so a token index is a line
+/// index into `old_spans`/`new_spans`.
+fn line_rows(old: &str, new: &str, old_spans: &[Vec<Span>], new_spans: &[Vec<Span>]) -> Vec<Row> {
+    let line = |spans: &[Vec<Span>], i: u32| spans.get(i as usize).cloned().unwrap_or_default();
+
+    let mut input = InternedInput::default();
+    input.update_before(old.split_inclusive('\n'));
+    input.update_after(new.split_inclusive('\n'));
+    // A token index addresses a highlighted line by the same count, or every line number past
+    // the first mismatch would be plausibly wrong rather than visibly broken (O6, overview.md).
+    debug_assert_eq!(input.before.len(), old_spans.len(), "old lines vs highlighted lines");
+    debug_assert_eq!(input.after.len(), new_spans.len(), "new lines vs highlighted lines");
+
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+
+    // An empty hunk at end-of-file emits the trailing context run and nothing else, so the
+    // gap-then-change body below handles the tail without a second copy of the same loop.
+    let (old_end, new_end) = (input.before.len() as u32, input.after.len() as u32);
+    let tail = Hunk { before: old_end..old_end, after: new_end..new_end };
+
+    let mut rows = Vec::new();
+    let (mut oi, mut ni) = (0u32, 0u32);
+    for hunk in diff.hunks().chain(std::iter::once(tail)) {
+        // Between hunks both sides hold the same lines, so the two cursors advance in lockstep.
+        debug_assert_eq!(
+            hunk.before.start - oi,
+            hunk.after.start - ni,
+            "the context run before a hunk is the same length on both sides"
+        );
+        while oi < hunk.before.start {
+            rows.push(Row::Context { old_no: oi + 1, new_no: ni + 1, spans: line(new_spans, ni) });
+            oi += 1;
+            ni += 1;
+        }
+        for o in hunk.before.clone() {
+            rows.push(Row::Deletion {
+                old_no: o + 1,
+                spans: line(old_spans, o),
+                emphasis: Vec::new(),
+            });
+        }
+        for n in hunk.after.clone() {
+            rows.push(Row::Insertion {
+                new_no: n + 1,
+                spans: line(new_spans, n),
+                emphasis: Vec::new(),
+            });
+        }
+        oi = hunk.before.end;
+        ni = hunk.after.end;
+    }
+    rows
 }
 
 /// Fill word-level `emphasis` on the related deletion/insertion lines of each change block
@@ -788,6 +823,49 @@ mod tests {
         assert_eq!(folds, 2, "leading and trailing runs fold");
         let change = d.rows.iter().find(|r| matches!(r, Row::Insertion { .. })).unwrap();
         assert_eq!(change.new_no(), Some(21)); // line 20 is 1-based line 21
+    }
+
+    /// The rows in display order as `(marker, text)`, folds skipped: the shape a reviewer reads.
+    fn shape(d: &FileDiff) -> Vec<(char, String)> {
+        d.rows
+            .iter()
+            .filter(|r| r.is_content())
+            .map(|r| (r.marker(), r.text().trim_end().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_added_function_is_one_insertion_block_from_attribute_to_brace() {
+        // The dominant shape in a code review: a whole function added before an existing one.
+        // The change block must open on the new function's attribute and close on its brace.
+        // A minimal-edit-script differ instead opens mid-body and trails a stray `#[test]`,
+        // leaving the two functions unreadably interleaved (specs/diff-view.md, "The model").
+        let old = "#[test]\nfn old_case() {\n    assert!(a);\n}\n";
+        let new = "#[test]\nfn new_case() {\n    assert!(b);\n}\n\n#[test]\nfn old_case() {\n    assert!(a);\n}\n";
+        let rows = shape(&build(old, new));
+        let changed: Vec<_> = rows.iter().filter(|(m, _)| *m != ' ').collect();
+        assert!(
+            changed.iter().all(|(m, _)| *m == '+'),
+            "adding a function deletes nothing: {changed:?}"
+        );
+        assert_eq!(changed.first().unwrap().1, "#[test]", "the block opens on the attribute");
+        assert_eq!(changed.last().unwrap().1, "", "and closes on the blank line after the brace");
+        assert!(
+            changed.iter().any(|(_, t)| t == "fn new_case() {"),
+            "the new function's signature is an insertion, not context reused from the old one",
+        );
+    }
+
+    #[test]
+    fn a_pure_insertion_before_a_pure_removal_still_orders_deletions_first() {
+        // Word emphasis reads a change block as deletions followed by insertions, so every
+        // hunk must emit that order regardless of how the engine groups it. Here one line is
+        // added at the top and an unrelated one removed at the bottom: two separate hunks.
+        let old = "keep\nremove me\n";
+        let new = "add me\nkeep\n";
+        let rows = shape(&build(old, new));
+        let markers: String = rows.iter().map(|(m, _)| *m).collect();
+        assert_eq!(markers, "+ -", "insertion, context, deletion — each hunk stands alone");
     }
 
     #[test]
