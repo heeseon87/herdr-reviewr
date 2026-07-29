@@ -617,6 +617,23 @@ fn world_wake(builds: bool) -> Duration {
 }
 
 /// Draw, then wait up to the poll deadline for input; refresh on each tick.
+/// The ASCII input source used while navigating the diff, so keyboard shortcuts fire on the first
+/// press (a Korean IME would hold each jamo for composition).
+const ASCII_IME: &str = "com.apple.keylayout.ABC";
+
+/// Best-effort macOS input-source switch via `macism`. macism (not im-select) actually activates
+/// CJK IMEs — im-select only selects the source, leaving a Korean IME in its English sub-mode so
+/// text stayed English. Fire-and-forget: a missing binary or a failure is ignored so the review UI
+/// never blocks or errors on the input source. stdio is nulled so it can't touch the TUI's terminal.
+fn set_ime(source: &str) {
+    let _ = std::process::Command::new("macism")
+        .arg(source)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
@@ -661,6 +678,12 @@ fn event_loop(
     // Fetch the PR snapshot as soon as the panel opens, not on first switching to the tab, so the
     // tab is already populated when the user gets there (specs/forge-host.md).
     app.pr_pending = None;
+    // Input-source auto-switch: ASCII while reviewing, the launcher's source (usually Korean) while
+    // composing a comment, so the user never toggles 한/영 by hand. Active only when the cmd+r
+    // picker exported HERDR_REVIEWR_IME; otherwise `comment_ime` is None and nothing is switched.
+    // `ime_composing` starts false because the launcher already set ASCII before exec.
+    let comment_ime = std::env::var("HERDR_REVIEWR_IME").ok().filter(|s| !s.is_empty());
+    let mut ime_composing = false;
     let result: Result<()> = (|| {
         while !app.should_quit {
             if let Ok((epoch, target, mut recovered)) = recovery_rx.try_recv() {
@@ -1096,6 +1119,15 @@ fn event_loop(
                     app.diff_scroll
                 );
                 last_poll = Instant::now();
+            }
+            // After handling this iteration's input, switch the input source if the composing state
+            // flipped: entering a comment → the launcher's source (Korean), leaving it → ASCII. Only
+            // fires on an actual transition, so macism runs at most once per comment open/close.
+            if app.composing() != ime_composing {
+                ime_composing = app.composing();
+                if let Some(src) = &comment_ime {
+                    set_ime(if ime_composing { src } else { ASCII_IME });
+                }
             }
         }
         Ok(())
