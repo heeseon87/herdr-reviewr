@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-06-24
-Last edited: 2026-07-28
+Last edited: 2026-07-30
 ---
 
 # Diff view
@@ -136,6 +136,9 @@ Returning to source differs per view:
 - Expanding replaces the fold with `context` rows. There is no manual collapse-back.
 - An expansion persists across refreshes of the same file. Opening another file starts collapsed. An edit that reshapes the fold may re-collapse it.
 - Expanding keeps the viewport still: a fold in the top half grows upward, one in the bottom half grows downward.
+- `expand-all-folds` (default `a`) expands every fold in the open file at once. It reaches that file only, so the next file opens collapsed.
+- `expand-always` (default `A`) is a standing mode: every fold shows expanded, in the open file and in every file visited while it is on. Switching it off collapses back to exactly the folds expanded by hand, since the mode records no anchors of its own. Like `wrap`, it is a session preference with no config key.
+- Both keep the cursor on its line across the rebuild, and the frame scrolls it back into view.
 
 ### Side-by-side layout
 

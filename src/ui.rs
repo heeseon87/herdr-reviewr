@@ -1570,6 +1570,9 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::SideBySide => {
             (hint(K::SideBySide), if app.side_by_side { "unified" } else { "columns" })
         }
+        A::ExpandAlways => {
+            (hint(K::ExpandAlways), if app.expand_always { "fold" } else { "unfold all" })
+        }
         A::IgnoreWhitespace => (
             hint(K::IgnoreWhitespace),
             if app.whitespace == crate::diff::Whitespace::Ignore { "show ws" } else { "hide ws" },

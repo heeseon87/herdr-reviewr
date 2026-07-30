@@ -1,7 +1,7 @@
 ---
 Status: Current
 Created: 2026-07-17
-Last edited: 2026-07-28
+Last edited: 2026-07-30
 ---
 
 # Input
@@ -38,6 +38,8 @@ The keymap is rebindable per action through `[keybindings]` in the plugin config
 | `wrap`                                                   | toggle line wrap                            | `w`                                         | —                             |
 | `side-by-side`                                           | toggle the two-column diff (`diff-view.md`) | `x`                                         | —                             |
 | `ignore-whitespace`                                      | toggle ignoring whitespace (`diff-view.md`) | `W`                                         | —                             |
+| `expand-all-folds`                                       | expand every fold in this file              | `a`                                         | —                             |
+| `expand-always`                                          | toggle expanding folds in every file        | `A`                                         | —                             |
 | `preview`                                                | toggle the markdown preview                 | `m`                                         | —                             |
 | `navigator-position`                                     | move the navigator clockwise                | `p`                                         | —                             |
 | `navigator-grow` / `navigator-shrink`                    | grow / shrink the navigator                 | `<` / `>`                                   | drag the divider              |
@@ -112,7 +114,7 @@ right of the `do` row.
 
 ```
  do    e edit · d delete · n/N jump · s send 2                                ?
- go    u/b/t scope · / search · ctrl+f find · w wrap · x columns · W hide ws · l list · y copy · r refresh · 1·2·3 tabs
+ go    u/b/t scope · / search · ctrl+f find · w wrap · x columns · W hide ws · A unfold all · l list · y copy · r refresh · 1·2·3 tabs
        tab files · p position · q quit
  move  j k · ] [ hunk · f F file · PageUp PageDown
 ```

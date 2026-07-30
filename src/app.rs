@@ -331,6 +331,7 @@ pub enum FooterAction {
     /// Toggle the side-by-side diff columns; the label names the destination layout
     /// (`x columns` unified, `x unified` in two columns).
     SideBySide,
+    ExpandAlways,
     IgnoreWhitespace,
     Scope,
     Send,
@@ -440,6 +441,11 @@ pub struct App {
     /// widening the pane restores the two columns. `side_by_side_active()` is the honest
     /// on-screen predicate.
     pub side_by_side: bool,
+    /// Whether every fold opens expanded, in every file, until switched off (specs/diff-view.md).
+    /// Global like `wrap` and `side_by_side`: a reviewer who wants full context wants it for the
+    /// whole pass, not per file. Holds no fold anchors of its own, so switching it off restores
+    /// exactly the folds `expanded_folds` records.
+    pub expand_always: bool,
     /// Whether whitespace-only differences count as changes in the `Changes` diff
     /// (specs/diff-view.md). Global like `wrap` and `side_by_side`, so a reviewer flips it once
     /// for a reformatting turn instead of per file.
@@ -637,6 +643,7 @@ impl App {
             h_scroll: 0,
             wrap: true,
             side_by_side: false,
+            expand_always: false,
             whitespace: crate::diff::Whitespace::Show,
             preview: false,
             preview_scroll: 0,
@@ -815,6 +822,7 @@ impl App {
                 self.stash = std::mem::take(&mut old.stash);
                 self.wrap = old.wrap;
                 self.side_by_side = old.side_by_side;
+                self.expand_always = old.expand_always;
                 self.whitespace = old.whitespace;
                 self.preview = old.preview;
                 self.preview_scroll = old.preview_scroll;
@@ -1150,8 +1158,11 @@ impl App {
             .rows
             .iter()
             .flat_map(|row| match row {
+                // `expand_always` reads as an expansion of every fold without recording one, so
+                // turning it off leaves exactly the folds the reviewer expanded by hand.
                 Row::Fold { lines }
-                    if row.fold_anchor().is_some_and(|a| self.expanded_folds.contains(&a)) =>
+                    if self.expand_always
+                        || row.fold_anchor().is_some_and(|a| self.expanded_folds.contains(&a)) =>
                 {
                     lines.clone()
                 }
@@ -1203,6 +1214,26 @@ impl App {
         self.expanded_folds.extend(anchors);
         self.rebuild_visible();
         self.settle_read();
+    }
+
+    /// Toggle expanding every fold in every file, for the rest of the session. Where
+    /// `expand_all_folds` opens this one file, this opens each file the reviewer visits next, so a
+    /// pass that wants full context is one keypress instead of one per file (specs/diff-view.md).
+    ///
+    /// The cursor keeps its line across the rebuild, since expanding shifts most rows below it.
+    /// Switching the mode off collapses back to whatever folds the reviewer expanded by hand:
+    /// the mode records no anchors of its own.
+    pub fn toggle_expand_always(&mut self) {
+        self.expand_always = !self.expand_always;
+        let anchor = self.visible.get(self.diff_cursor).and_then(row_anchor);
+        self.rebuild_visible();
+        if let Some(anchor) = anchor
+            && let Some(i) = self.nearest_row_at_line(anchor)
+        {
+            self.diff_cursor = i;
+        }
+        self.settle_read();
+        self.reveal_diff = true;
     }
 
     /// The old and new content of `file` for the current scope: old from `HEAD` (or the
@@ -3842,6 +3873,8 @@ impl App {
         // key. It reaches the Diff view only, so the File view does not list it.
         if self.whitespace_toggle_available() {
             out.push((A::IgnoreWhitespace, Go));
+            // The sticky unfold sits beside it: same reach, and the label names the destination.
+            out.push((A::ExpandAlways, Go));
         }
         if !self.store.is_empty() {
             out.push((A::List, Go));

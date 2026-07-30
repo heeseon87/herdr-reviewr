@@ -1557,6 +1557,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::NavigatorGrow => app.resize_navigator(4),
             K::NavigatorShrink => app.resize_navigator(-4),
             K::ExpandAllFolds => app.expand_all_folds(),
+            K::ExpandAlways => app.toggle_expand_always(),
             K::NextUnreviewed => app.jump_unreviewed(1),
             K::PrevUnreviewed => app.jump_unreviewed(-1),
             K::ScopeUncommitted => app.set_scope(Scope::Uncommitted)?,

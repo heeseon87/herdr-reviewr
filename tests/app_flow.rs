@@ -3788,6 +3788,91 @@ fn the_side_by_side_toggle_keeps_the_cursor_on_its_line() {
     assert_eq!(app.diff_cursor, deletion, "and comes back unmoved");
 }
 
+/// Two long files, each with one edit in the middle, so each opens with a leading and a trailing
+/// fold. A short file has no fold at all, which would make the mode look like it did nothing.
+fn folded_files_repo() -> Repo {
+    use std::fmt::Write as _;
+    let body = |tag: &str| {
+        (0..60).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "{tag} line {i}");
+            s
+        })
+    };
+    let r = Repo::init();
+    r.write("one.rs", &body("one"));
+    r.write("two.rs", &body("two"));
+    r.commit_all("init");
+    r.write("one.rs", &body("one").replace("one line 30", "one EDIT ONE"));
+    r.write("two.rs", &body("two").replace("two line 30", "two EDIT TWO"));
+    r
+}
+
+/// How many folds the open file currently shows.
+fn fold_count(app: &App) -> usize {
+    app.visible.iter().filter(|row| row.hidden() > 0).count()
+}
+
+#[test]
+fn expand_always_opens_every_file_unfolded_and_a_is_only_this_file() {
+    // `a` expands this file and nothing else. `A` is the standing mode: the file after it opens
+    // unfolded too, which is the whole point (specs/diff-view.md).
+    let r = folded_files_repo();
+    let mut app = app_on(&r);
+    assert!(fold_count(&app) > 0, "a long file opens with folds");
+
+    app.expand_all_folds();
+    assert_eq!(fold_count(&app), 0, "`a` unfolds this file");
+    app.next_file();
+    assert!(fold_count(&app) > 0, "`a` did not carry to the next file");
+
+    app.toggle_expand_always();
+    assert_eq!(fold_count(&app), 0, "`A` unfolds the open file at once");
+    app.next_file();
+    assert_eq!(fold_count(&app), 0, "and every file opened after it");
+}
+
+#[test]
+fn switching_expand_always_off_keeps_the_folds_expanded_by_hand() {
+    // The mode records no anchors, so switching it off must leave exactly the hand-expanded folds
+    // rather than collapsing everything or keeping everything open.
+    let r = folded_files_repo();
+    let mut app = app_on(&r);
+    let collapsed = fold_count(&app);
+    assert!(collapsed >= 2, "the fixture opens with a leading and a trailing fold: {collapsed}");
+
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|row| row.hidden() > 0).unwrap();
+    expand_fold(&mut app);
+    let by_hand = fold_count(&app);
+    assert_eq!(by_hand, collapsed - 1, "one fold opened by hand");
+
+    app.toggle_expand_always();
+    assert_eq!(fold_count(&app), 0);
+    app.toggle_expand_always();
+    assert_eq!(
+        fold_count(&app),
+        by_hand,
+        "back to the hand-expanded state, not to fully collapsed"
+    );
+}
+
+#[test]
+fn expand_always_keeps_the_cursor_on_its_line() {
+    let r = folded_files_repo();
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    app.diff_cursor = app.visible.iter().position(|row| row.text().contains("EDIT ONE")).unwrap();
+    let line = app.visible[app.diff_cursor].new_no();
+
+    app.toggle_expand_always();
+    assert_eq!(
+        app.visible[app.diff_cursor].new_no(),
+        line,
+        "unfolding shifts most rows below the cursor, so it holds its line, not its index",
+    );
+    assert!(app.reveal_diff, "and the frame scrolls it back into view");
+}
+
 /// A file whose diff is one real edit buried in a wholesale re-indent: the case the whitespace
 /// toggle exists for.
 fn reindented_repo() -> Repo {
